@@ -1,0 +1,15 @@
+name: matchers
+on: issue_comment
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "::add-matcher::.github/matchers/lint.json"
+      - run: |
+          echo "src/a.rs:3:7: warning: unused variable"
+          echo "src/b.rs:9:1: error: mismatched types"
+          echo "kind=${{ case(github.event_name == 'push', 'push', github.event_name == 'issue_comment', 'comment', 'other') }}"
+      - run: echo "::remove-matcher owner=lint::"
+      - run: |
+          echo "src/c.rs:1:1: error: after removal"

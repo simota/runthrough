@@ -1,0 +1,15 @@
+name: strict-called
+on:
+  workflow_call:
+    inputs:
+      need:
+        type: string
+        required: true
+    secrets:
+      must:
+        required: true
+jobs:
+  show:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "strict got need=${{ inputs.need }} must=${{ secrets.must }} token=${{ secrets.GITHUB_TOKEN }}"

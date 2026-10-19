@@ -1,0 +1,15 @@
+name: build
+
+on: [push, pull_request]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Images like catthehacker/ubuntu:act-latest have no Rust.
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build
+      # The e2e tests run node actions; images like rust:1 lack node.
+      - run: command -v node || (apt-get update -qq && apt-get install -y -qq nodejs >/dev/null)
+      - run: cargo test

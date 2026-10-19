@@ -1,0 +1,17 @@
+name: greet
+inputs:
+  who:
+    description: who to greet
+    default: world
+outputs:
+  greeting:
+    value: ${{ steps.say.outputs.text }}
+runs:
+  using: composite
+  steps:
+    - id: say
+      shell: bash
+      run: |
+        echo "hello ${{ inputs.who }} from $(basename "$GITHUB_ACTION_PATH")"
+        echo "action ref [${{ github.action_ref }}] repo [${{ github.action_repository }}]"
+        echo "text=hello ${{ inputs.who }}" >> "$GITHUB_OUTPUT"

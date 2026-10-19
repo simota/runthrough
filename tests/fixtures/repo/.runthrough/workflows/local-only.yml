@@ -1,0 +1,7 @@
+name: local-only
+on: status
+jobs:
+  rehearse:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "from .runthrough"

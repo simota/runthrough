@@ -1,0 +1,12 @@
+name: dockerfile
+inputs:
+  who:
+    default: nobody
+outputs:
+  said:
+    description: greeting
+runs:
+  using: docker
+  image: Dockerfile
+  args: ["${{ inputs.who }}"]
+  post-entrypoint: /post.sh

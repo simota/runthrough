@@ -1,0 +1,13 @@
+name: skipped
+on: push
+jobs:
+  nowhere:
+    runs-on: no-such-runner
+    continue-on-error: true
+    steps:
+      - run: echo unreachable
+  after:
+    needs: nowhere
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "after ran"

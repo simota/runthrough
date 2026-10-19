@@ -1,0 +1,12 @@
+name: checkout
+on: fork
+jobs:
+  other:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: actions/hello-world-javascript-action
+          ref: main
+          path: other
+      - run: test -f other/action.yml && echo "other repo checked out at $(git -C other rev-parse --abbrev-ref HEAD)"

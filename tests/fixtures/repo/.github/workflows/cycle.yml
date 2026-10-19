@@ -1,0 +1,5 @@
+name: cycle
+on: [gollum, workflow_call]
+jobs:
+  self:
+    uses: ./.github/workflows/cycle.yml

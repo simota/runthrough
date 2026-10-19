@@ -1,0 +1,20 @@
+name: release
+on: release
+jobs:
+  remote-action:
+    runs-on: ubuntu-latest
+    steps:
+      - id: g
+        uses: example/greet@v1
+        with:
+          who: mapped
+      - run: echo "mapped action said ${{ steps.g.outputs.greeting }}"
+  remote-workflow:
+    uses: example/workflows/.github/workflows/reusable.yml@v1
+    with:
+      name: remote
+  after:
+    needs: remote-workflow
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "mapped workflow said ${{ needs.remote-workflow.outputs.message }}"

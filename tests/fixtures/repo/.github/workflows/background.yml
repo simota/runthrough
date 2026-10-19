@@ -1,0 +1,84 @@
+name: background
+on: discussion
+jobs:
+  steps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - id: server
+        background: true
+        run: |
+          echo "BG_ENV=from-bg" >> "$GITHUB_ENV"
+          echo "port=1234" >> "$GITHUB_OUTPUT"
+          sleep 1
+      - run: echo "before wait '${{ steps.server.outputs.port }}' '$BG_ENV'"
+      - wait: server
+      - run: echo "after wait ${{ steps.server.outputs.port }} $BG_ENV ${{ steps.server.outcome }}"
+      - id: forever
+        background: true
+        run: sleep 300
+      - cancel: forever
+      - run: echo "forever ${{ steps.forever.outcome }}"
+      - parallel:
+          - id: a
+            run: sleep 1; echo "v=a" >> "$GITHUB_OUTPUT"
+          - id: b
+            run: sleep 1; echo "v=b" >> "$GITHUB_OUTPUT"
+      - run: echo "parallel ${{ steps.a.outputs.v }}${{ steps.b.outputs.v }}"
+      - id: bad
+        background: true
+        continue-on-error: true
+        run: exit 3
+      - wait-all:
+      - run: echo "bad ${{ steps.bad.outcome }} ${{ steps.bad.conclusion }}"
+  unwaited:
+    runs-on: ubuntu-latest
+    steps:
+      - background: true
+        run: exit 1
+      - run: echo "next step ran"
+  # fail-fast cancels leg 1 while its background step runs: first at a step
+  # boundary, then (leg 3) while the job waits for it at its end.
+  failfast:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        n: [1, 2, 3]
+    steps:
+      - if: matrix.n != 2
+        background: true
+        run: sleep 60
+      - run: sleep ${{ matrix.n == 1 && 2 || matrix.n == 2 && 1 || 0.2 }}
+      - if: matrix.n == 2
+        run: exit 1
+  # Ten background steps take every slot; the queued eleventh is cancelled
+  # without waiting for one.
+  slots:
+    runs-on: ubuntu-latest
+    steps:
+      - run: date +%s > "$RUNNER_TEMP/t0"
+      - {background: true, run: sleep 6}
+      - {background: true, run: sleep 6}
+      - {background: true, run: sleep 6}
+      - {background: true, run: sleep 6}
+      - {background: true, run: sleep 6}
+      - {background: true, run: sleep 6}
+      - {background: true, run: sleep 6}
+      - {background: true, run: sleep 6}
+      - {background: true, run: sleep 6}
+      - {background: true, run: sleep 6}
+      - {id: queued, background: true, run: echo "queued ran"}
+      - cancel: queued
+      - run: echo "queued ${{ steps.queued.outcome }} after $(( $(date +%s) - $(cat "$RUNNER_TEMP/t0") ))s"
+  # A timed-out background step takes its whole process group with it
+  # (checked inside a container, where /proc lists the processes).
+  timeout:
+    runs-on: ubuntu-latest
+    steps:
+      - id: b
+        background: true
+        timeout-minutes: 0.05
+        run: sleep 300 & sleep 301
+      - wait: b
+        continue-on-error: true
+      - run: n=0; for p in /proc/[0-9]*; do tr '\0' ' ' < $p/cmdline 2>/dev/null | grep -q "^sleep 30[01]" && n=$((n+1)); done; echo "timeout left $n"

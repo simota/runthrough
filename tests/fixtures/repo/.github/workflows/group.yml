@@ -1,0 +1,9 @@
+name: group
+on: watch
+jobs:
+  grouped:
+    runs-on:
+      group: my-runners
+      labels: no-such-label
+    steps:
+      - run: echo "ran via group, tool cache [$RUNNER_TOOL_CACHE]" && (cat "$RUNNER_TOOL_CACHE/marker" 2>/dev/null || true); echo persisted > "$RUNNER_TOOL_CACHE/marker"

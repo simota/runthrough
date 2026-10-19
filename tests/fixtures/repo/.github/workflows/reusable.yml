@@ -1,0 +1,21 @@
+name: reusable
+on:
+  workflow_call:
+    inputs:
+      name:
+        type: string
+        required: true
+      flag:
+        type: boolean
+        default: true
+    outputs:
+      message:
+        value: ${{ jobs.greet.outputs.message }}
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+    outputs:
+      message: ${{ steps.m.outputs.message }}
+    steps:
+      - id: m
+        run: echo "message=hello ${{ inputs.name }} flag=${{ inputs.flag == true && 'on' || 'off' }} token=${{ secrets.TOKEN }}" >> "$GITHUB_OUTPUT"

@@ -1,0 +1,33 @@
+name: caller
+on:
+  workflow_dispatch:
+    inputs:
+      who:
+        default: nobody
+jobs:
+  info:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "event=${{ github.event_name }} actor=${{ github.actor }} default=${{ github.event.repository.default_branch }} who=${{ inputs.who }}"
+      - run: echo "server=${{ github.server_url }} api=${{ github.api_url }} repo=${{ github.repository }}"
+      - if: ${{ !env.ACT }}
+        run: echo "not skipped by env.ACT"
+      - run: echo "event.inputs.who=${{ github.event.inputs.who }} var=${{ vars.FROMENV }} env=$FROMENV"
+      - run: echo "ref=${{ github.ref }} ref_name=${{ github.ref_name }} sha=${{ github.sha }} imageos=$ImageOS perflog=$RUNNER_PERFLOG retention=$GITHUB_RETENTION_DAYS"
+      - run: echo "::set-env name=UNSAFE::blocked"
+      - env:
+          ACTIONS_ALLOW_UNSECURE_COMMANDS: "true"
+        run: echo "::set-env name=ALLOWED::yes"
+      - id: az
+        run: echo "##[set-output name=greeting;]from azure"
+      - run: echo "unsafe=[$UNSAFE] allowed=[$ALLOWED] az=${{ steps.az.outputs.greeting }}"
+  call:
+    uses: ./.github/workflows/reusable.yml
+    with:
+      name: ${{ inputs.who }}
+    secrets: inherit
+  after:
+    needs: call
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "reusable said ${{ needs.call.outputs.message }}"

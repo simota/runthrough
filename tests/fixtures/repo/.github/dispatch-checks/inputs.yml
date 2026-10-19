@@ -1,0 +1,16 @@
+name: dispatch-inputs
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        type: choice
+        options: [dev, prod]
+        required: true
+      dry:
+        type: boolean
+        default: false
+jobs:
+  show:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "target=${{ inputs.target }} dry=${{ inputs.dry }}"

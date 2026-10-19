@@ -1,0 +1,8 @@
+name: merge-group
+on: merge_group
+jobs:
+  queue:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "base=${{ github.event.merge_group.base_sha != '' }} ref=${{ github.ref == github.event.merge_group.head_ref }} sha=${{ github.sha == github.event.merge_group.head_sha }} base_ref=${{ github.event.merge_group.base_ref }}"

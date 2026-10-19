@@ -1,0 +1,31 @@
+name: artifacts
+on: page_build
+jobs:
+  up:
+    runs-on: ubuntu-latest
+    steps:
+      - run: mkdir -p out/sub && echo hello > out/a.txt && seq 1 5000 > out/sub/big.txt
+      - uses: actions/upload-artifact@v3
+        with:
+          name: v3art
+          path: out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v4art
+          path: out
+  down:
+    needs: up
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v3
+        with:
+          name: v3art
+          path: got3
+      - uses: actions/download-artifact@v4
+        with:
+          name: v4art
+          path: got4
+      - run: |
+          seq 1 5000 > expected.txt
+          cmp got3/sub/big.txt expected.txt && cmp got4/sub/big.txt expected.txt
+          echo "artifacts v3=$(cat got3/a.txt) v4=$(cat got4/a.txt)"

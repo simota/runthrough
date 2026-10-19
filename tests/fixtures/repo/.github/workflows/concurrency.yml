@@ -1,0 +1,59 @@
+name: concurrency
+run-name: run by ${{ github.actor }}
+on: milestone
+concurrency: wf-${{ github.workflow }}
+cache-mode: read
+permissions:
+  contents: read
+jobs:
+  queued:
+    runs-on: ubuntu-latest
+    cache-mode: none
+    permissions: read-all
+    strategy:
+      matrix:
+        n: [1, 2, 3]
+    concurrency:
+      group: Queue
+      queue: max
+    environment:
+      name: stage-${{ matrix.n }}
+      url: https://example.test/${{ steps.u.outputs.path }}
+    steps:
+      - id: u
+        run: |
+          lock="${TMPDIR:-/tmp}/runthrough-concurrency-${{ github.run_id }}"
+          mkdir "$lock" || { echo "legs overlapped"; exit 1; }
+          sleep 1
+          rmdir "$lock"
+          echo "path=p${{ matrix.n }}" >> "$GITHUB_OUTPUT"
+  replaced:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        n: [1, 2, 3]
+    concurrency: replace
+    steps:
+      - run: sleep 1
+  superseded:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        n: [1, 2]
+    concurrency:
+      group: sup
+      cancel-in-progress: true
+    steps:
+      - run: sleep 2
+      - run: echo "leg ${{ matrix.n }} continued"
+  # The workflow already holds this group: GitHub cancels instead of waiting.
+  deadlock:
+    runs-on: ubuntu-latest
+    concurrency: WF-${{ github.workflow }}
+    steps:
+      - run: echo "deadlocked job ran"
+  calls:
+    concurrency: concurrency-x
+    uses: ./.github/workflows/called-concurrency.yml
+    with:
+      tag: x

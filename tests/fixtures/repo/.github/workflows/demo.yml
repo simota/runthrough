@@ -1,0 +1,43 @@
+name: demo
+on: [push, workflow_dispatch]
+env:
+  GREETING: hi
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        run: |
+          echo "version=1.2.${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+          echo "FROM_ENV_FILE=yes" >> "$GITHUB_ENV"
+      - run: test "$FROM_ENV_FILE" = yes && test -f README.md && echo "env=$GREETING"
+      - id: greet
+        uses: ./.github/actions/greet
+        with:
+          who: runthrough
+      - run: echo "composite said '${{ steps.greet.outputs.greeting }}'"
+      - run: echo "masked ${{ secrets.TOKEN }}"
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        n: [1, 2]
+        include:
+          - n: 3
+    steps:
+      - run: echo "matrix n=${{ matrix.n }} version=${{ needs.build.outputs.version }}"
+      - if: matrix.n == 2
+        run: exit 1
+        continue-on-error: true
+      - if: failure()
+        run: echo "should not run"
+  report:
+    needs: [build, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "results ${{ join(needs.*.result, ',') }}"

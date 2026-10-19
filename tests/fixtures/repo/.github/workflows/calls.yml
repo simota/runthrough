@@ -1,0 +1,15 @@
+name: calls
+on: issues
+jobs:
+  good:
+    uses: ./.github/workflows/strict-called.yml
+    with:
+      need: yes
+    secrets:
+      must: ${{ secrets.MUST }}
+  bad:
+    uses: ./.github/workflows/strict-called.yml
+    with:
+      extra: 1
+    secrets:
+      other: x

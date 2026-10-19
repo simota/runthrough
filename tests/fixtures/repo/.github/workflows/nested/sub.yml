@@ -1,0 +1,7 @@
+name: nested
+on: repository_dispatch
+jobs:
+  sub:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "nested workflow ran"

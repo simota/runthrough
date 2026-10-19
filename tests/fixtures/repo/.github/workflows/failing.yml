@@ -1,0 +1,20 @@
+name: failing
+on: pull_request
+jobs:
+  js:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: js
+        uses: ./.github/actions/js
+        with:
+          value: ab
+      - run: test "${{ steps.js.outputs.doubled }}" = abab
+      - run: exit 3
+      - if: failure()
+        run: echo "cleanup after failure"
+  never:
+    needs: js
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo unreachable

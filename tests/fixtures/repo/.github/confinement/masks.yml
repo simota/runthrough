@@ -1,0 +1,21 @@
+name: masks
+on: push
+jobs:
+  token:
+    runs-on: ubuntu-latest
+    outputs:
+      tok: ${{ steps.t.outputs.tok }}
+    steps:
+      - id: t
+        run: |
+          tok="minted-$(echo QQQ)"
+          echo "::add-mask::$tok"
+          echo "tok=$tok" >> "$GITHUB_OUTPUT"
+      - run: printf 'pem %s\n' "$KEY"
+        env:
+          KEY: ${{ secrets.KEY }}
+  use:
+    needs: token
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "got ${{ needs.token.outputs.tok }}"

@@ -1,0 +1,769 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RunThrough</title>
+<style>
+:root {
+  --ground: #F4F5F8; --surface: #FFFFFF; --line: #E1E4EA; --line-strong: #CDD2DB;
+  --ink: #16181D; --muted: #4A5060; --accent: #2A55D8; --accent-soft: #E3E8F7;
+  --bar: #121419; --bar-ink: #E9EBF0; --bar-muted: #A9AFBC;
+  --success: #17784A; --failure: #C03328; --running: #9A5A00; --neutral: #5B6270;
+  --failure-soft: #FDF6F5; --failure-line: #F0C9C4; --warning-soft: #FBF4E8;
+  /* Text fields are told apart by their border alone: 3:1 against the surface. */
+  --field-line: #7D8494;
+  --log: #121419; --log-ink: #D9DDE5; --log-dim: #8D94A3; --log-err: #FF8B80; --log-err-bg: #3A1D1D;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ground: #0F1115; --surface: #171A20; --line: #262A33; --line-strong: #353B47;
+    --ink: #E9EBF0; --muted: #A9AFBC; --accent: #7C9BFF; --accent-soft: #1E2740;
+    --success: #4CC38A; --failure: #FF7A6E; --running: #E0A040; --neutral: #9AA1AE;
+    --failure-soft: #2A1716; --failure-line: #5A2A26; --warning-soft: #2A2214;
+    --field-line: #6E7584;
+    /* Header and log sit apart from the ground and cards, as they do in light. */
+    --bar: #1C2028; --log: #0A0B0E;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--ground); color: var(--ink); font: 14px/20px system-ui, -apple-system, "Segoe UI", sans-serif; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, .mono { font-family: var(--mono); font-size: 13px; }
+header { background: var(--bar); color: var(--bar-ink); display: flex; flex-wrap: wrap; align-items: center; gap: 16px; padding: 10px 24px; }
+header .brand { display: flex; align-items: center; gap: 10px; color: #fff; font-weight: 600; font-size: 16px; }
+header nav { display: flex; flex-wrap: wrap; gap: 8px; color: var(--bar-muted); }
+header nav a { color: var(--bar-ink); }
+header .tools { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+header .tools a { color: var(--bar-ink); }
+header .tools a[aria-current] { font-weight: 600; text-decoration: underline; text-underline-offset: 4px; }
+header .live { color: var(--bar-muted); font-size: 13px; display: flex; align-items: center; gap: 8px; }
+header .live[hidden] { display: none; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: #3CCB7F; }
+.wrap { max-width: 1360px; margin: 0 auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; }
+.cols { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start; }
+.side { flex: 1 1 220px; max-width: 260px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 8px; display: flex; flex-direction: column; gap: 2px; }
+.side a { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 6px; color: var(--ink); }
+.side a.on { background: var(--accent-soft); font-weight: 600; }
+.side .label { font-size: 12px; font-weight: 600; color: var(--muted); padding: 10px 10px 4px; letter-spacing: .04em; text-transform: uppercase; }
+.main { flex: 999 1 560px; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+.card h2 { margin: 0; padding: 14px 16px; border-bottom: 1px solid var(--line); font-size: 16px; line-height: 24px; font-weight: 600; }
+.title { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; }
+.title h1 { margin: 0; font-size: 24px; line-height: 32px; font-weight: 600; }
+.title .who { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.sub { color: var(--muted); }
+.table { overflow-x: auto; }
+.row { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr) minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: center; padding: 14px 16px; border-bottom: 1px solid var(--line); min-width: 760px; color: var(--ink); }
+.row:last-child { border-bottom: 0; }
+.row.head { padding: 10px 16px; font-size: 12px; font-weight: 600; color: var(--muted); background: var(--ground); }
+a.row:hover { background: var(--ground); text-decoration: none; }
+.row.failure { background: var(--failure-soft); }
+.group { display: flex; align-items: baseline; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); min-width: 760px; font-weight: 600; }
+.card h2.group { padding: 10px 16px; font-size: 14px; line-height: 20px; }
+.group .sub { font-weight: 400; font-size: 13px; }
+.seg { display: inline-flex; align-items: center; gap: 4px; }
+.seg button[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.run { display: flex; gap: 12px; min-width: 0; }
+.run b { display: block; }
+.ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.stats div { background: var(--surface); padding: 14px 16px; }
+.stats small { display: block; font-size: 12px; color: var(--muted); }
+.stats b { display: block; margin-top: 2px; }
+.cmd { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 6px 8px 6px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+.cmd code { flex: 1 1 320px; min-width: 0; color: var(--muted); overflow-x: auto; white-space: nowrap; }
+button { min-height: 36px; padding: 0 12px; border-radius: 6px; font: inherit; cursor: pointer; background: var(--surface); color: var(--ink); border: 1px solid var(--line-strong); }
+.graph { overflow-x: auto; padding: 24px; background: var(--ground); border-radius: 0 0 8px 8px; }
+.stages { display: flex; align-items: flex-start; min-width: max-content; }
+.stage { display: flex; flex-direction: column; gap: 8px; flex: none; }
+.stage small { color: var(--muted); font-size: 12px; }
+.link { width: 48px; height: 2px; background: #9AA1AE; margin-top: 47px; flex: none; }
+.job { display: flex; flex-direction: column; gap: 6px; width: 240px; padding: 10px; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 8px; }
+.job .name { display: flex; justify-content: space-between; padding: 2px 4px; font-weight: 600; }
+a.job.single, div.job.single { flex-direction: row; align-items: center; gap: 8px; padding: 12px 14px; color: var(--ink); font-weight: 600; }
+a.job.single:hover { text-decoration: none; border-color: var(--accent); }
+.job.single .secs { margin-left: auto; white-space: nowrap; color: var(--muted); font-weight: 400; }
+.leg { display: flex; align-items: center; gap: 8px; padding: 8px; border-radius: 6px; background: var(--ground); color: var(--ink); }
+.leg .secs { margin-left: auto; white-space: nowrap; color: var(--muted); }
+.note { display: flex; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+.note:last-child { border-bottom: 0; }
+.banner { display: flex; gap: 12px; padding: 12px 16px; background: var(--failure-soft); border: 1px solid var(--failure-line); border-radius: 8px; }
+.log { background: var(--log); color: var(--log-ink); font-family: var(--mono); font-size: 13px; line-height: 20px; border-radius: 0 0 8px 8px; overflow: hidden; }
+.log details { border-bottom: 1px solid #22262F; }
+.log summary { display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 0 16px; cursor: pointer; color: #E9EBF0; list-style: none; }
+.log summary::-webkit-details-marker { display: none; }
+.log summary .chev { transition: transform .1s; flex: none; }
+.log details[open] summary .chev { transform: rotate(90deg); }
+.log summary .secs { margin-left: auto; color: var(--log-dim); }
+.log .skipped { color: var(--log-dim); }
+.lines { padding: 0 16px 12px 46px; overflow-x: auto; }
+.line { display: flex; gap: 16px; white-space: pre; }
+.line .n { flex: none; width: 32px; text-align: right; color: var(--log-dim); user-select: none; }
+.line.err { color: var(--log-err); background: var(--log-err-bg); }
+/* A hit is marked by a bar as well as a tint: the tint alone is too faint to tell. */
+.line.hit { background: #3A3416; box-shadow: inset 3px 0 #E0A040; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; padding: 8px 16px; border-bottom: 1px solid var(--line); }
+input[type=search] { min-height: 36px; padding: 0 10px; border: 1px solid var(--field-line); border-radius: 6px; font: inherit; background: var(--surface); color: var(--ink); }
+.kv { display: grid; grid-template-columns: minmax(120px, max-content) minmax(0, 1fr); gap: 6px 16px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.kv:last-child { border-bottom: 0; }
+.kv h3 { grid-column: 1 / -1; margin: 0; font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: .04em; text-transform: uppercase; }
+.kv code { overflow-wrap: anywhere; }
+.cell { display: grid; min-width: 0; }
+.empty { padding: 32px 16px; text-align: center; color: var(--muted); }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+/* Where the sidebar and the main column no longer fit side by side (220 + 16 +
+   560 + the page's padding and scrollbar), the job list follows the page's
+   content: a job page leads with its log. */
+@media (max-width: 880px) {
+  .side { order: 2; max-width: none; }
+}
+@media (max-width: 640px) {
+  .wrap { padding: 16px; } header { padding: 10px 16px; }
+  .kv { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <a class="brand" href="#/"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M10 8.5v7l5.5-3.5z"/></svg>RunThrough</a>
+  <nav id="crumbs" aria-label="Breadcrumb"></nav>
+  <div class="tools"><span class="live" id="live" hidden><span class="dot"></span><span>live</span></span><a id="nav-resources" href="#/resources">Resources</a></div>
+</header>
+<main id="app" class="wrap"></main>
+<div id="status" class="sr" role="status"></div>
+<script>
+"use strict";
+const ICONS = {
+  success: ['var(--success)', '<circle cx="12" cy="12" r="9"/><path d="m8 12.5 2.7 2.7L16.5 9.5"/>', 'Success'],
+  failure: ['var(--failure)', '<circle cx="12" cy="12" r="9"/><path d="m9 9 6 6M15 9l-6 6"/>', 'Failure'],
+  warning: ['var(--running)', '<path d="M12 4 2.5 20h19z"/><path d="M12 10v4M12 17h.01"/>', 'Failed, continued'],
+  running: ['var(--running)', '<circle cx="12" cy="12" r="9" stroke-opacity=".3"/><path d="M12 3a9 9 0 0 1 9 9"/>', 'In progress'],
+  queued: ['var(--neutral)', '<circle cx="12" cy="12" r="9" stroke-dasharray="3 3"/>', 'Queued'],
+  skipped: ['var(--neutral)', '<circle cx="12" cy="12" r="9"/><path d="m6 18 12-12"/>', 'Skipped'],
+  cancelled: ['var(--neutral)', '<circle cx="12" cy="12" r="9"/><path d="m6 18 12-12"/>', 'Cancelled'],
+  interrupted: ['var(--neutral)', '<circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/>', 'Interrupted'],
+};
+const LABEL = { success: 'Success', failure: 'Failure', warning: 'Continued on error', running: 'In progress', queued: 'Queued', skipped: 'Skipped', cancelled: 'Cancelled', interrupted: 'Interrupted' };
+const COLOR = { success: 'var(--success)', failure: 'var(--failure)', running: 'var(--running)', warning: 'var(--running)' };
+
+function icon(status, size = 20) {
+  const [color, body, label] = ICONS[status] || ICONS.queued;
+  const span = document.createElement('span');
+  span.style.display = 'inline-flex';
+  span.style.flex = 'none';
+  // Static markup only: no run data goes into innerHTML.
+  span.innerHTML = `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" role="img" aria-label="${label}">${body}</svg>`;
+  return span;
+}
+function chevron() {
+  const span = document.createElement('span');
+  span.className = 'chev';
+  span.style.display = 'inline-flex';
+  span.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#A9AFBC" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>';
+  return span;
+}
+
+/** h('div', {class: 'x'}, 'text', child) — text always goes in as text nodes. */
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'style') el.style.cssText = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v === true ? '' : v);
+  }
+  for (const k of kids.flat()) {
+    if (k == null || k === false) continue;
+    el.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  }
+  return el;
+}
+
+function dur(secs) {
+  if (secs == null || isNaN(secs)) return '—';
+  if (secs < 60) return secs.toFixed(1) + 's';
+  const m = Math.floor(secs / 60), s = Math.round(secs % 60);
+  return m < 60 ? `${m}m ${String(s).padStart(2, '0')}s` : `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+function when(t) {
+  const d = new Date(t * 1000), now = new Date();
+  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return d.toDateString() === now.toDateString() ? 'today ' + time : d.toLocaleDateString() + ' ' + time;
+}
+function elapsed(run) { return (run.finished || Date.now() / 1000) - run.meta.started; }
+function shortSha(s) { return s ? s.slice(0, 7) : ''; }
+function runTitle(run) { return (run.meta.workflows || []).map(w => w.name).join(', ') || '(no workflow)'; }
+/** The breadcrumb trail, whose last part is the current page and also names the document. */
+function crumbs(...parts) {
+  const nav = document.getElementById('crumbs');
+  parts[parts.length - 1].setAttribute('aria-current', 'page');
+  nav.replaceChildren(...parts.flatMap((p, i) => [i ? h('span', { 'aria-hidden': 'true' }, '/') : null, p]).filter(Boolean));
+  document.title = [...parts.slice(1).reverse().map(p => p.textContent), parts.length > 1 ? null : parts[0].textContent, 'RunThrough'].filter(Boolean).join(' · ');
+}
+/** Say `text` to assistive technology; the page itself is not a live region, since every poll redraws it. */
+function announce(text) {
+  const el = document.getElementById('status');
+  el.textContent = '';
+  setTimeout(() => { el.textContent = text; }, 50);
+}
+async function api(path) {
+  let r;
+  try {
+    r = await fetch(path, { cache: 'no-store' });
+  } catch {
+    throw Object.assign(new Error('The dashboard server cannot be reached. Is runthrough --dashboard still running?'), { retry: true });
+  }
+  if (r.status === 404) throw new Error('Not found. The run may have been removed: only the newest 100 runs are kept.');
+  if (!r.ok) throw Object.assign(new Error(`The dashboard server returned an error (HTTP ${r.status}).`), { retry: true });
+  return r.json();
+}
+function legHref(id, wf, job) { return `#/run/${id}/job/${encodeURIComponent(wf)}/${encodeURIComponent(job)}`; }
+/** The key of a job's log and open steps across refreshes. */
+function jobKey(id, wf, job) { return `${id}/${wf}/${job}`; }
+
+// ------------------------------------------------------------------ views
+
+// How the runs list is grouped: remembered per browser, a convenience only.
+const GROUPS = { none: 'None', repo: 'Repository', date: 'Date' };
+let groupBy = (() => { try { return GROUPS[localStorage.getItem('runthrough.group')] ? localStorage.getItem('runthrough.group') : 'none'; } catch { return 'none'; } })();
+function groupKey(run) {
+  const m = run.meta;
+  if (groupBy === 'repo') return m.repository || m.root || 'Unknown repository';
+  const d = new Date(m.started * 1000), today = new Date();
+  const yesterday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1);
+  if (d.toDateString() === today.toDateString()) return 'Today';
+  if (d.toDateString() === yesterday.toDateString()) return 'Yesterday';
+  return d.toLocaleDateString([], { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+// The runs list's filter: kept while the page is open, across navigation.
+const STATUSES = { all: 'All', success: 'Success', failure: 'Failure', running: 'In progress', interrupted: 'Interrupted' };
+let runQuery = '', runStatus = 'all';
+function runMatches(run) {
+  if (runStatus !== 'all' && run.status !== runStatus) return false;
+  const q = runQuery.trim().toLowerCase();
+  if (!q) return true;
+  const m = run.meta;
+  return [runTitle(run), m.repository, m.root, m.event, m.ref_name, m.sha, m.engine, ...(run.failed || []).map(f => f.job)]
+    .some(v => v && String(v).toLowerCase().includes(q));
+}
+
+function viewRuns(allRuns) {
+  crumbs(h('span', {}, 'All runs'));
+  const runs = allRuns.filter(runMatches);
+  // A row is one link, so its cells cannot be table cells: each names its column in
+  // hidden text instead, and the visible header is hidden from assistive technology.
+  const head = h('div', { class: 'row head', 'aria-hidden': 'true' }, h('span', {}, 'Run'), h('span', {}, 'Status'), h('span', {}, 'Runs on'), h('span', {}, 'Duration'), h('span', {}, 'Started'));
+  const col = name => h('span', { class: 'sr' }, name + ': ');
+  const rows = runs.map(run => {
+    const m = run.meta, failed = run.failed && run.failed[0];
+    const title = runTitle(run), source = [m.repository, m.event, [m.ref_name, shortSha(m.sha)].filter(Boolean).join(' @ ')].filter(Boolean).join(' · ');
+    const reason = failed && `${failed.job}${failed.error ? ' · ' + failed.error : ''}`;
+    return h('a', { class: 'row' + (run.status === 'failure' ? ' failure' : ''), href: '#/run/' + m.id },
+      h('div', { class: 'run' }, icon(run.status),
+        h('div', { style: 'min-width:0' }, h('b', { class: 'ellipsis', title }, title),
+          h('div', { class: 'sub ellipsis', title: source }, source))),
+      h('div', { style: 'min-width:0' },
+        h('div', { style: `color:${COLOR[run.status] || 'var(--neutral)'};font-weight:500` }, col('Status'), LABEL[run.status] || run.status),
+        failed ? h('div', { class: 'sub ellipsis', title: reason }, reason) : null),
+      h('div', { class: 'sub' }, m.engine ? [col('Runs on'), m.engine] : ''),
+      h('div', { class: 'mono' }, col('Duration'), run.status === 'running' ? dur(elapsed(run)) + '…' : dur(elapsed(run))),
+      h('div', { class: 'sub' }, col('Started'), when(m.started)));
+  });
+  // Groups keep the list's order: the one with the newest run comes first.
+  let body = rows;
+  if (groupBy !== 'none') {
+    const groups = new Map();
+    runs.forEach((run, i) => {
+      const k = groupKey(run);
+      if (!groups.has(k)) groups.set(k, { runs: [], rows: [] });
+      groups.get(k).runs.push(run);
+      groups.get(k).rows.push(rows[i]);
+    });
+    body = [...groups].flatMap(([k, g]) => {
+      const failed = g.runs.filter(r => r.status === 'failure').length;
+      return [h('h2', { class: 'group' }, h('span', { class: 'ellipsis' }, k),
+        h('span', { class: 'sub' }, `${g.runs.length} run${g.runs.length > 1 ? 's' : ''}`),
+        failed ? h('span', { class: 'sub', style: 'color:var(--failure)' }, `${failed} failed`) : null), ...g.rows];
+    });
+  }
+  const seg = h('div', { class: 'seg', role: 'group', 'aria-label': 'Group runs by' }, h('span', { class: 'sub' }, 'Group by'),
+    Object.entries(GROUPS).map(([k, label]) => h('button', { type: 'button', 'aria-pressed': String(groupBy === k), onclick: () => {
+      groupBy = k;
+      try { localStorage.setItem('runthrough.group', k); } catch { /* a convenience only */ }
+      if (last) show(last);
+    } }, label)));
+  const filter = h('div', { class: 'toolbar' },
+    h('input', { type: 'search', placeholder: 'Filter by workflow, repository, branch, event or commit', value: runQuery, 'aria-label': 'Filter runs', style: 'flex: 1 1 280px',
+      oninput: e => {
+        runQuery = e.target.value;
+        // Filtering redraws what the page has; it fetches nothing.
+        clearTimeout(searchTimer);
+        searchTimer = setTimeout(() => last && show(last), 150);
+      } }),
+    h('div', { class: 'seg', role: 'group', 'aria-label': 'Filter runs by status' }, h('span', { class: 'sub' }, 'Status'),
+      Object.entries(STATUSES).map(([k, label]) => h('button', { type: 'button', 'aria-pressed': String(runStatus === k), onclick: () => {
+        runStatus = k;
+        if (last) show(last);
+      } }, label))));
+  const empty = allRuns.length
+    ? h('div', { class: 'empty' }, `No runs match the filter (${allRuns.length} recorded).`)
+    : h('div', { class: 'empty' }, 'No runs recorded yet. Run ', h('code', {}, 'runthrough'), ' in a repository and it shows up here.');
+  return [
+    h('div', { class: 'title' }, h('div', {}, h('h1', {}, 'Runs'), h('div', { class: 'sub' }, 'Runs recorded on this machine, newest first.')), allRuns.length ? seg : null),
+    h('div', { class: 'card table' }, allRuns.length ? filter : null, head, rows.length ? body : empty),
+  ];
+}
+
+function legsOf(run, wf, id) { return run.jobs.filter(j => j.workflow === wf && j.id === id); }
+
+/** The run's sidebar; `on` is 'summary', 'config' or the job being shown. */
+function sideNav(run, on) {
+  const id = run.meta.id;
+  const link = (here, href, ...kids) => h('a', { class: here ? 'on' : null, 'aria-current': here ? 'page' : null, href }, ...kids);
+  return h('nav', { class: 'side', 'aria-label': 'Run' },
+    link(on === 'summary', '#/run/' + id, 'Summary'),
+    link(on === 'config', `#/run/${id}/config`, 'Configuration'),
+    h('div', { class: 'label' }, 'Jobs'),
+    run.jobs.map(j => link(on && j.job === on.job && j.workflow === on.workflow, legHref(id, j.workflow, j.job), icon(j.status, 16), h('span', { class: 'ellipsis', title: j.job }, j.job))));
+}
+
+/** A matrix leg's label inside its job's card: `build (linux, 20)` → `linux, 20`, the name being the card's title. */
+function legLabel(leg, job, name) {
+  for (const prefix of [name, job.id]) {
+    if (leg.startsWith(prefix + ' (') && leg.endsWith(')')) return leg.slice(prefix.length + 2, -1);
+  }
+  return leg;
+}
+
+function viewRun(run, config) {
+  const m = run.meta;
+  if (config) crumbs(h('a', { href: '#/' }, 'Runs'), h('a', { href: '#/run/' + m.id }, runTitle(run)), h('span', {}, 'Configuration'));
+  else crumbs(h('a', { href: '#/' }, 'Runs'), h('span', {}, runTitle(run)));
+  const side = sideNav(run, config ? 'config' : 'summary');
+  const graphs = (m.workflows || []).map(wf => {
+    const byStage = [];
+    for (const j of wf.jobs) (byStage[j.stage] = byStage[j.stage] || []).push(j);
+    const cols = [];
+    byStage.forEach((jobs, i) => {
+      if (i) cols.push(h('div', { class: 'link', 'aria-hidden': 'true' }));
+      cols.push(h('div', { class: 'stage' }, h('small', {}, 'Stage ' + i),
+        jobs.map(j => {
+          const legs = legsOf(run, wf.name, j.id);
+          const name = j.name || j.id;
+          // Without matrix legs a job is one row: its name once, with its status.
+          if (legs.length === 1 && legs[0].job === j.id) {
+            const l = legs[0];
+            return h('a', { class: 'job single', href: legHref(m.id, l.workflow, l.job) }, icon(l.status, 16), h('span', { class: 'ellipsis' }, name), h('span', { class: 'secs mono' }, l.secs != null ? dur(l.secs) : ''));
+          }
+          if (!legs.length) {
+            const waiting = run.status === 'running';
+            return h('div', { class: 'job single' }, icon(waiting ? 'queued' : 'skipped', 16), h('span', { class: 'ellipsis' }, name), h('span', { class: 'secs' }, waiting ? 'Waiting' : 'Did not run'));
+          }
+          return h('div', { class: 'job' },
+            h('div', { class: 'name' }, h('span', {}, name), h('span', { class: 'sub' }, legs.length + (legs.length > 1 ? ' jobs' : ' job'))),
+            legs.map(l => h('a', { class: 'leg', href: legHref(m.id, l.workflow, l.job), title: l.job }, icon(l.status, 16), h('span', { class: 'ellipsis' }, legLabel(l.job, j, name)), h('span', { class: 'secs mono' }, l.secs != null ? dur(l.secs) : ''))));
+        })));
+    });
+    return h('section', { class: 'card', 'aria-label': 'Job graph of ' + wf.name },
+      h('h2', {}, wf.name, ' ', h('span', { class: 'sub', style: 'font-weight:400' }, String(wf.file || '').split('/').pop())),
+      h('div', { class: 'graph' }, h('div', { class: 'stages' }, cols)));
+  });
+  const notes = [];
+  for (const j of run.jobs) {
+    if (j.status === 'failure') notes.push(['failure', j, j.error || 'Job failed']);
+    for (const s of j.steps) if (s.status === 'warning') notes.push(['warning', j, `Step “${s.name}” failed and continued (continue-on-error).`]);
+  }
+  const cmd = shellQuote(m.argv);
+  return [
+    h('div', { class: 'title' }, h('div', { class: 'who' }, icon(run.status, 28),
+      h('div', {}, h('h1', {}, runTitle(run)), h('div', { class: 'sub' }, `${m.event} · ${m.ref_name || ''} · started ${when(m.started)} on ${m.engine}`))),
+      run.run_names.length ? h('div', { class: 'sub' }, run.run_names.map(r => r.run_name).join(' · ')) : null),
+    h('div', { class: 'stats' },
+      h('div', {}, h('small', {}, 'Triggered via'), h('b', {}, `${m.event} · ${m.ref_name || '—'}`)),
+      h('div', {}, h('small', {}, 'Status'), h('b', { style: `color:${COLOR[run.status] || 'inherit'}` }, LABEL[run.status] || run.status)),
+      h('div', {}, h('small', {}, 'Total duration'), h('b', { class: 'mono' }, dur(elapsed(run)))),
+      h('div', {}, h('small', {}, 'Repository'), h('b', { class: 'ellipsis', title: m.repository || m.root }, m.repository || m.root)),
+      h('div', {}, h('small', {}, 'Commit'), h('b', { class: 'mono' }, shortSha(m.sha) || '—'))),
+    h('div', { class: 'cmd' }, h('code', {}, '$ ' + cmd),
+      copyButton('Copy command', () => cmd)),
+    h('div', { class: 'cols' }, side, h('div', { class: 'main' }, config ? configCard(m.config) : [...graphs,
+      notes.length ? h('section', { class: 'card', 'aria-label': 'Annotations' }, h('h2', {}, 'Annotations'),
+        notes.map(([k, j, text]) => h('div', { class: 'note' }, icon(k, 18), h('div', {}, h('a', { href: legHref(m.id, j.workflow, j.job), style: 'font-weight:600' }, j.job), h('div', { class: 'sub' }, text))))) : null])),
+  ];
+}
+
+// What the run was given (-e/.env, --var, --input, -s, -P), as recorded with
+// values masked; secrets come by name only. Every group shows, set or not; runs
+// recorded before have no record of it.
+function configCard(c) {
+  const groups = [
+    ['Environment', c?.env], ['Variables', c?.vars], ['Inputs', c?.inputs],
+    ['Secrets', c && Object.fromEntries((c.secrets || []).map(k => [k, '***']))], ['Platforms', c?.platforms],
+  ];
+  const none = c ? 'Not set' : 'Not recorded for this run';
+  return h('section', { class: 'card', 'aria-label': 'Configuration' }, h('h2', {}, 'Configuration'),
+    groups.map(([title, kv]) => h('div', { class: 'kv' }, h('h3', {}, title),
+      kv && Object.keys(kv).length
+        ? Object.entries(kv).flatMap(([k, v]) => [h('code', {}, k), h('code', { class: 'sub' }, v)])
+        : h('span', { class: 'sub', style: 'grid-column: 1 / -1' }, none))));
+}
+
+const openSteps = new Map();
+let query = '';
+/** Which of the search's hits Enter last scrolled to. */
+let hitAt = -1;
+
+// Per job page, every step's lines so far and the element showing them: a poll
+// fetches (`skip`) and draws only the lines added since the previous one.
+const jobLogs = new Map();
+function jobLog(key) {
+  if (!jobLogs.has(key)) jobLogs.set(key, []);
+  return jobLogs.get(key);
+}
+function mergeJob(key, job) {
+  const log = jobLog(key);
+  job.steps.forEach((s, i) => {
+    const c = log[i] || (log[i] = { lines: [], box: null, drawn: 0, q: '' });
+    c.lines.length = Math.min(c.lines.length, s.from || 0);
+    for (const l of s.lines) c.lines.push(l);
+    s.lines = c.lines;
+  });
+  return job;
+}
+function isHit(l, q) { return q !== '' && l.toLowerCase().includes(q); }
+function lineEl(l, n, q) {
+  return h('div', { class: 'line' + (/(^|\s)(❌|❗)|\bError\b|\berror:/.test(l) ? ' err' : '') + (isHit(l, q) ? ' hit' : '') },
+    h('span', { class: 'n' }, String(n + 1)), h('span', {}, l));
+}
+/** The step's lines element, with lines appended since the last draw and hits marked for `q`. */
+function linesBox(c, q) {
+  if (!c.box || c.drawn > c.lines.length) { c.box = h('div', { class: 'lines' }); c.drawn = 0; c.q = q; }
+  if (c.q !== q) {
+    for (const el of c.box.children) el.classList.toggle('hit', isHit(el.lastChild.textContent, q));
+    c.q = q;
+  }
+  for (; c.drawn < c.lines.length; c.drawn++) c.box.append(lineEl(c.lines[c.drawn], c.drawn, q));
+  return c.box;
+}
+
+const LLM_TAIL = 200;
+function failedSteps(job) { return job.steps.filter(s => s.status === 'failure' || s.status === 'warning'); }
+function shellQuote(argv) { return (argv || []).map(a => /[\s"'$]/.test(a) ? `'${a.replace(/'/g, `'\\''`)}'` : a).join(' '); }
+/** A failed job as Markdown to paste into an LLM: context, steps, and the failed steps' log tails. */
+function llmReport(run, job) {
+  const m = run.meta;
+  const wf = (m.workflows || []).find(w => w.name === job.workflow);
+  const file = wf && wf.file && m.root && wf.file.startsWith(m.root + '/') ? wf.file.slice(m.root.length + 1) : wf && wf.file;
+  const plain = l => l.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+  const fence = lines => { const t = lines.join('\n'); const f = '`'.repeat(Math.max(3, ...(t.match(/`+/g) || []).map(s => s.length + 1))); return `${f}text\n${t}\n${f}`; };
+  const out = [
+    'A GitHub Actions job failed when run locally with RunThrough (an act-style runner). Find the cause and suggest a fix.',
+    '',
+    '## Job',
+    `- Workflow: ${job.workflow}${file ? ` (${file})` : ''}`,
+    `- Job: ${job.job}${job.runs_on ? ` on ${job.runs_on}` : ''}`,
+    `- Result: ${LABEL[job.status] || job.status}${job.error ? ` — ${job.error}` : ''}`,
+    `- Event: ${m.event}${m.ref_name ? ` · ${m.ref_name}` : ''}${m.sha ? ` @ ${shortSha(m.sha)}` : ''}${m.repository ? ` · ${m.repository}` : ''}`,
+    `- Command: \`${shellQuote(m.argv)}\``,
+    '',
+    '## Steps',
+    ...job.steps.map(s => `- ${LABEL[s.status] || s.status}: ${s.name}${s.secs != null ? ` (${dur(s.secs)})` : ''}`),
+  ];
+  // A job that failed outside a step (no image, a bad expression) shows its last step instead.
+  const shown = failedSteps(job).length ? failedSteps(job) : job.steps.slice(-1);
+  for (const s of shown) {
+    const lines = s.lines.map(plain);
+    const cut = lines.length > LLM_TAIL;
+    out.push('', `## Log of “${s.name}”${cut ? ` (last ${LLM_TAIL} of ${lines.length} lines)` : ''}`, fence(cut ? lines.slice(-LLM_TAIL) : lines));
+  }
+  return out.join('\n') + '\n';
+}
+/** Copy to the clipboard, also where the page is not a secure context (no `navigator.clipboard`). */
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(text);
+  const ta = h('textarea', { style: 'position:fixed;opacity:0' });
+  ta.value = text;
+  document.body.append(ta);
+  ta.select();
+  const ok = document.execCommand('copy');
+  ta.remove();
+  if (!ok) throw new Error('copy failed');
+}
+/** A button copying `text()`, which says whether it worked on itself and to assistive technology. */
+function copyButton(label, text, attrs) {
+  const done = (e, said) => { e.target.textContent = said; announce(said); };
+  return h('button', { type: 'button', ...attrs, onclick: e => copyText(text()).then(() => done(e, 'Copied'), () => done(e, 'Copy failed')) }, label);
+}
+
+function viewJob(run, job) {
+  const m = run.meta;
+  crumbs(h('a', { href: '#/' }, 'Runs'), h('a', { href: '#/run/' + m.id }, runTitle(run)), h('span', {}, job.job));
+  const key = jobKey(m.id, job.workflow, job.job);
+  if (!openSteps.has(key)) openSteps.set(key, new Set(job.steps.map((s, i) => [s, i]).filter(([s]) => s.status === 'failure' || s.status === 'running').map(([, i]) => i)));
+  const open = openSteps.get(key);
+  const side = sideNav(run, job);
+  const q = query.toLowerCase();
+  const log = jobLog(key);
+  const steps = job.steps.map((s, i) => {
+    const d = h('details', { open: open.has(i) || (q !== '' && s.lines.some(l => isHit(l, q))) },
+      h('summary', {}, chevron(), icon(s.status, 16), h('span', { class: s.status === 'skipped' ? 'skipped' : null }, s.name), h('span', { class: 'secs' }, s.secs != null ? dur(s.secs) : s.status === 'running' ? '…' : '')),
+      s.lines.length ? linesBox(log[i], q) : null);
+    d.addEventListener('toggle', () => { d.open ? open.add(i) : open.delete(i); });
+    return d;
+  });
+  const hits = q === '' ? [] : job.steps.map(s => s.lines.filter(l => isHit(l, q)).length);
+  const total = hits.reduce((a, b) => a + b, 0);
+  const found = q === '' ? '' : total ? `${total} match${total > 1 ? 'es' : ''} in ${hits.filter(Boolean).length} step${hits.filter(Boolean).length > 1 ? 's' : ''}` : 'No matches';
+  const search = h('input', { type: 'search', placeholder: 'Search logs', value: query, 'aria-label': 'Search logs', title: 'Enter: next match',
+    oninput: e => {
+      query = e.target.value;
+      hitAt = -1;
+      // Searching redraws what the page has; it fetches nothing.
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => {
+        if (!last) return;
+        show(last);
+        const said = document.getElementById('found');
+        if (said) announce(said.textContent);
+      }, 150);
+    },
+    onkeydown: e => {
+      if (e.key !== 'Enter') return;
+      const lines = document.querySelectorAll('#app .line.hit');
+      if (!lines.length) return;
+      hitAt = hitAt < 0 ? (e.shiftKey ? lines.length - 1 : 0) : (hitAt + (e.shiftKey ? -1 : 1) + lines.length) % lines.length;
+      lines[hitAt].scrollIntoView({ block: 'center' });
+    } });
+  return [
+    h('div', { class: 'title' }, h('div', { class: 'who' }, icon(job.status, 28),
+      h('div', { style: 'min-width:0' }, h('h1', {}, job.job), h('div', { class: 'sub' },
+        `${LABEL[job.status] || job.status}${job.secs != null ? ' in ' + dur(job.secs) : ''}${job.runs_on ? ' · ' + job.runs_on : ''} · ${job.workflow}`))),
+      job.status === 'failure' || failedSteps(job).length
+        ? copyButton('Copy for LLM', () => llmReport(run, job), { title: 'Copy this job’s context and failed step logs as Markdown' }) : null),
+    job.error ? h('div', { class: 'banner', role: 'alert' }, icon('failure', 18), h('div', {}, h('b', {}, job.error))) : null,
+    h('div', { class: 'cols' }, side, h('div', { class: 'main' }, h('section', { class: 'card', 'aria-label': 'Steps' },
+      h('div', { class: 'toolbar' }, h('b', {}, 'Steps'), h('div', { class: 'seg' }, h('span', { class: 'sub', id: 'found' }, found), search)),
+      h('div', { class: 'log' }, steps.length ? steps : h('div', { class: 'empty' }, 'No steps ran.'))))),
+  ];
+}
+
+function viewResources(res, runs) {
+  crumbs(h('span', {}, 'Resources'));
+  const byPid = new Map();
+  for (const r of runs) if (r.meta.pid != null && !byPid.has(r.meta.pid)) byPid.set(r.meta.pid, r);
+  const owner = x => (x.pid == null ? null : byPid.get(x.pid) || null);
+  // A per-run resource outlives its run only when cleanup did not happen. Whether the
+  // process lives comes from the server: a run recorded nowhere (--no-history) has no owner here.
+  const leftBehind = x => x.pid != null && !x.alive;
+  const runCell = x => {
+    if (x.pid == null) return h('span', { class: 'sub' }, 'Shared');
+    const r = owner(x);
+    return h('div', { style: 'min-width:0' },
+      r ? h('a', { class: 'ellipsis', style: 'display:block', href: '#/run/' + r.meta.id }, runTitle(r)) : h('span', { class: 'sub' }, 'pid ' + x.pid),
+      leftBehind(x) ? h('div', { style: 'color:var(--failure);font-size:12px' }, 'Left behind') : null);
+  };
+  // `rows` is null for a kind Docker could not list: that is unknown, not empty.
+  const table = (title, cols, head, rows, empty) => h('section', { class: 'card', 'aria-label': title },
+    h('h2', {}, title, ' ', h('span', { class: 'sub', style: 'font-weight:400' }, rows ? String(rows.length) : '—')),
+    h('div', { class: 'table', role: 'table', 'aria-label': title },
+      h('div', { class: 'row head', role: 'row', style: `grid-template-columns:${cols}` }, head.map(t => h('span', { role: 'columnheader' }, t))),
+      !rows ? h('div', { class: 'empty' }, 'Not listed: Docker could not be reached (see above).')
+        : rows.length ? rows.map(cells => h('div', { class: 'row', role: 'row', style: `grid-template-columns:${cols}` }, cells.map(c => h('div', { class: 'cell', role: 'cell' }, c))))
+        : h('div', { class: 'empty' }, empty)));
+  const containers = res.containers || [], networks = res.networks || [], volumes = res.volumes || [];
+
+  const ports = [];
+  if (location.port) ports.push([Number(location.port), 'Dashboard (this page)', h('span', { class: 'sub' }, '—')]);
+  for (const r of runs.filter(r => r.status === 'running')) {
+    const s = r.meta.servers || {};
+    const link = h('a', { href: '#/run/' + r.meta.id }, runTitle(r));
+    if (s.cache) ports.push([s.cache, 'Cache server', link]);
+    if (s.artifacts) ports.push([s.artifacts, 'Artifact server', link.cloneNode(true)]);
+  }
+  for (const c of containers) {
+    // 0.0.0.0 and [::] publish the same port: list it once.
+    const seen = new Set();
+    for (const p of c.ports) if (!seen.has(p.port)) { seen.add(p.port); ports.push([p.port, `${c.name} → ${p.to}`, runCell(c)]); }
+  }
+  ports.sort((a, b) => a[0] - b[0]);
+
+  const stale = [
+    ['docker rm -f', containers.filter(leftBehind)],
+    ['docker network rm', networks.filter(leftBehind)],
+    ['docker volume rm', volumes.filter(leftBehind)],
+  ].filter(([, xs]) => xs.length).map(([cmd, xs]) => `${cmd} ${xs.map(x => x.name).join(' ')}`).join('; ');
+  const mono = t => h('span', { class: 'mono ellipsis', title: t }, t);
+  return [
+    h('div', { class: 'title' }, h('div', {}, h('h1', {}, 'Resources'),
+      h('div', { class: 'sub' }, 'Ports, containers, networks and volumes RunThrough is using on this machine.'))),
+    res.error ? h('div', { class: 'banner', role: 'alert' }, icon('failure', 18), h('div', {}, h('b', {}, 'Docker could not be listed. '), 'RunThrough lists Docker resources only, so Apple container resources do not show here. ', h('span', { class: 'mono' }, res.error))) : null,
+    stale ? h('div', { class: 'cmd' }, h('code', {}, '$ ' + stale),
+      copyButton('Copy cleanup command', () => stale)) : null,
+    table('Ports', 'minmax(0,1fr) minmax(0,4fr) minmax(0,2fr)', ['Port', 'Used by', 'Run'],
+      ports.map(([port, what, run]) => [h('span', { class: 'mono' }, String(port)), mono(what), run]), 'No ports in use.'),
+    table('Containers', 'minmax(0,3fr) minmax(0,2fr) minmax(0,2fr) minmax(0,2fr)', ['Name', 'Image', 'State', 'Run'],
+      res.containers && containers.map(c => [mono(c.name), mono(c.image),
+        h('span', { style: `color:${c.state === 'running' ? 'var(--success)' : 'var(--muted)'}` }, c.status || c.state), runCell(c)]),
+      'No RunThrough containers.'),
+    table('Networks', 'minmax(0,5fr) minmax(0,2fr)', ['Name', 'Run'], res.networks && networks.map(n => [mono(n.name), runCell(n)]), 'No RunThrough networks.'),
+    table('Volumes', 'minmax(0,5fr) minmax(0,2fr)', ['Name', 'Run'], res.volumes && volumes.map(v => [mono(v.name), runCell(v)]), 'No RunThrough volumes.'),
+  ];
+}
+
+// ------------------------------------------------------------------ routing
+
+let timer = null, searchTimer = null;
+/** What the page shows: the data fetched last, for redrawing without fetching. */
+let last = null;
+// Each render takes a number; a slower, older one (a poll still waiting on the
+// API when the user navigates) is dropped instead of replacing the newer page.
+let generation = 0;
+/** The data `last` was drawn from, to skip a poll that brought nothing new. */
+let lastSig = null;
+
+/** Where focus is, as something that survives re-rendering: a link's href, the n-th step, or the search box and its caret. */
+function focusKey(app) {
+  const el = document.activeElement;
+  if (!el || !app.contains(el)) return null;
+  if (el.matches('input[type=search]')) return { search: [el.selectionStart, el.selectionEnd] };
+  if (el.matches('summary')) return { summary: [...app.querySelectorAll('summary')].indexOf(el) };
+  if (el.matches('a[href]')) return { href: el.getAttribute('href') };
+  if (el.matches('button')) return { button: el.textContent };
+  return null;
+}
+function restoreFocus(app, key) {
+  if (!key) return;
+  let el = null;
+  if (key.search) el = app.querySelector('input[type=search]');
+  else if (key.summary != null) el = app.querySelectorAll('summary')[key.summary];
+  else if (key.href != null) el = [...app.querySelectorAll('a[href]')].find(a => a.getAttribute('href') === key.href);
+  else if (key.button != null) el = [...app.querySelectorAll('button')].find(b => b.textContent === key.button);
+  if (!el) return;
+  el.focus({ preventScroll: true });
+  if (key.search) el.setSelectionRange(...key.search);
+}
+
+/** The page the hash names: `#/run/<id>`, then `/job/<workflow>/<job>` or `/config`; `#/resources`; or the runs list. */
+function parseRoute() {
+  const parts = location.hash.replace(/^#\/?/, '').split('/').map(decodeURIComponent);
+  return { page: parts[0], id: parts[1], view: parts[2], workflow: parts[3], job: parts[4] };
+}
+
+/**
+ * Fetch what `route` shows into `state`: `data`, `live` while a run it shows is running
+ * (set as soon as the run is known, so a failed job fetch is retried), `list` for the pages that list runs.
+ */
+async function load(route, state) {
+  if (route.page === 'run' && route.id) {
+    const run = await api('/api/runs/' + encodeURIComponent(route.id));
+    state.live = run.status === 'running';
+    const key = jobKey(route.id, route.workflow, route.job);
+    const skip = route.view === 'job' ? jobLog(key).map(c => c.lines.length).join(',') : '';
+    const job = route.view === 'job'
+      ? await api(`/api/runs/${encodeURIComponent(route.id)}/job?workflow=${encodeURIComponent(route.workflow)}&job=${encodeURIComponent(route.job)}&skip=${skip}`)
+      : null;
+    state.data = { run, job, config: route.view === 'config' };
+  } else if (route.page === 'resources') {
+    const [resources, runs] = await Promise.all([api('/api/resources'), api('/api/runs')]);
+    Object.assign(state, { data: { resources, runs }, live: runs.some(r => r.status === 'running'), list: true });
+  } else {
+    const runs = await api('/api/runs');
+    Object.assign(state, { data: { runs }, live: runs.some(r => r.status === 'running'), list: true });
+  }
+}
+
+async function render() {
+  clearTimeout(timer);
+  const mine = ++generation;
+  const route = parseRoute();
+  // A page that is slow to come says so, rather than leaving the previous one up.
+  const slow = last ? null : setTimeout(() => {
+    if (mine === generation && !last) document.getElementById('app').replaceChildren(h('div', { class: 'card empty' }, 'Loading…'));
+  }, 200);
+  // The runs list keeps polling so runs started later show up; other pages only while running.
+  const state = { data: undefined, live: false, list: false };
+  let error = null;
+  try {
+    await load(route, state);
+  } catch (e) {
+    error = e;
+  }
+  clearTimeout(slow);
+  const { data, live, list } = state;
+  if (mine !== generation) return;
+  // A live page redraws anyway: its durations count up.
+  const sig = error ? 'error ' + error.message : JSON.stringify(data);
+  if (live || !last || sig !== lastSig) {
+    lastSig = sig;
+    if (data && data.job) mergeJob(jobKey(route.id, route.workflow, route.job), data.job);
+    last = { data, live, error };
+    show(last, true);
+  }
+  if (live || list || (error && error.retry)) timer = setTimeout(render, live ? 1500 : 3000);
+}
+
+/** Fade a scroll box's edge where more content lies past it, so a cut-off stage reads as "scroll on". */
+function edgeFade(el) {
+  const left = el.scrollLeft > 0, right = el.scrollLeft + el.clientWidth < el.scrollWidth - 1;
+  el.style.maskImage = left || right
+    ? `linear-gradient(to right, ${left ? 'transparent, #000 48px' : '#000'}, ${right ? '#000 calc(100% - 48px), transparent' : '#000'})`
+    : '';
+}
+document.addEventListener('scroll', e => { if (e.target.classList && e.target.classList.contains('graph')) edgeFade(e.target); }, true);
+window.addEventListener('resize', () => document.querySelectorAll('.graph').forEach(edgeFade));
+
+// A redraw replaces every element, so it waits while the user is composing text with
+// an input method, or, for a poll, has text selected on the page.
+let composing = false, pending = false;
+function busy(poll) {
+  if (composing) return true;
+  const sel = poll && document.getSelection();
+  return !!sel && !sel.isCollapsed && document.getElementById('app').contains(sel.anchorNode);
+}
+document.addEventListener('compositionstart', () => { composing = true; });
+document.addEventListener('compositionend', () => { composing = false; if (pending && last) show(last); });
+document.addEventListener('selectionchange', () => { if (pending && last && !busy(true)) show(last); });
+
+/** The run shown last and its status, to announce when it changes; and the page announced last. */
+let shownRun = null, shownHash = null;
+
+function show({ data, live, error }, poll = false) {
+  if (busy(poll)) { pending = true; return; }
+  pending = false;
+  const app = document.getElementById('app');
+  let view;
+  if (error) {
+    crumbs(h('a', { href: '#/' }, 'Runs'), h('span', {}, 'Error'));
+    view = [h('div', { class: 'card empty', role: 'alert' }, h('p', {}, 'Could not load this page. ', error.message),
+      error.retry ? h('p', {}, 'Trying again every few seconds. ', h('button', { type: 'button', onclick: render }, 'Retry now')) : h('a', { href: '#/' }, 'Back to all runs'))];
+  } else if (data.resources) view = viewResources(data.resources, data.runs);
+  else if (data.runs) view = viewRuns(data.runs);
+  else view = data.job ? viewJob(data.run, data.job) : viewRun(data.run, data.config);
+  const focus = focusKey(app);
+  const scroll = window.scrollY;
+  const scrolledBoxes = () => app.querySelectorAll('.graph, .lines');
+  const across = [...scrolledBoxes()].map(el => el.scrollLeft);
+  app.replaceChildren(...view.flat().filter(Boolean));
+  window.scrollTo(0, scroll);
+  const boxes = scrolledBoxes();
+  if (boxes.length === across.length) boxes.forEach((el, i) => { el.scrollLeft = across[i]; });
+  app.querySelectorAll('.graph').forEach(edgeFade);
+  restoreFocus(app, focus);
+  // The dot means "refreshing": shown only while a run is in progress.
+  document.getElementById('live').hidden = !live;
+  const resources = document.getElementById('nav-resources');
+  if (data && data.resources) resources.setAttribute('aria-current', 'page'); else resources.removeAttribute('aria-current');
+  if (location.hash !== shownHash) { shownHash = location.hash; announce(document.title); }
+  const run = data && data.run;
+  if (run && shownRun && shownRun.id === run.meta.id && shownRun.status !== run.status) announce(`${runTitle(run)}: ${LABEL[run.status] || run.status}`);
+  shownRun = run ? { id: run.meta.id, status: run.status } : null;
+}
+window.addEventListener('hashchange', () => { query = ''; hitAt = -1; last = null; lastSig = null; jobLogs.clear(); clearTimeout(searchTimer); window.scrollTo(0, 0); render(); });
+render();
+</script>
+</body>
+</html>

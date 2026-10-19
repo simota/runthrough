@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="runthrough runs your GitHub Actions workflows locally: an act-style runner written in Rust.">
+<title>runthrough</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Stencil+Display:wght@700;900&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: a rehearsal-room floor. Sections are marked like stage positions with
+   strips of spike tape; the terminal is the stage, lit by one ghost light. */
+:root {
+  --floor: #e7e9eb;
+  --floor-2: #dcdfe2;
+  --ink: #15181b;
+  --muted: #555c64;
+  --line: #c4c9ce;
+  --tape: #f3c21c;
+  --tape-ink: #1a1a17;
+  --cue: #2a62c9;
+  --ok: #2c8a52;
+  --warn: #b7791f;
+  --bad: #c9402d;
+  --stage: #101214;
+  --stage-ink: #d8dde2;
+  --stage-dim: #7d858e;
+  --glow: rgba(255, 214, 120, .38);
+
+  --display: "Big Shoulders Stencil Display", "Arial Narrow", Impact, sans-serif;
+  --body: "Instrument Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --step--1: .875rem;
+  --step-0: 1rem;
+  --step-1: 1.25rem;
+  --step-2: 1.75rem;
+  --step-3: clamp(2.25rem, 4.5vw, 3.25rem);
+  --step-4: clamp(3rem, 8vw, 6.25rem);
+  --wrap: 72rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --floor: #16181b; --floor-2: #1d2024; --ink: #e6e9ec; --muted: #9aa2ab; --line: #2d3137;
+    --tape: #f0c02a; --tape-ink: #191814; --cue: #86aef5; --ok: #5cc185; --warn: #e3a948; --bad: #ef7a66;
+    --stage: #0b0c0e; --stage-ink: #d8dde2; --stage-dim: #7d858e; --glow: rgba(255, 214, 120, .22);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --floor: #16181b; --floor-2: #1d2024; --ink: #e6e9ec; --muted: #9aa2ab; --line: #2d3137;
+  --tape: #f0c02a; --tape-ink: #191814; --cue: #86aef5; --ok: #5cc185; --warn: #e3a948; --bad: #ef7a66;
+  --stage: #0b0c0e; --stage-ink: #d8dde2; --stage-dim: #7d858e; --glow: rgba(255, 214, 120, .22);
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--floor);
+  color: var(--ink);
+  font: 400 var(--step-0)/1.6 var(--body);
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--cue); text-underline-offset: 3px; }
+a:focus-visible, button:focus-visible { outline: 2px solid var(--cue); outline-offset: 3px; border-radius: 2px; }
+code, pre, kbd { font-family: var(--mono); }
+h1, h2, h3 { text-wrap: balance; margin: 0; }
+p { margin: 0; }
+
+.wrap {
+  max-width: var(--wrap);
+  margin: 0 auto;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--line); }
+
+/* Spike tape: the section marker. */
+.tape {
+  display: inline-block;
+  background: var(--tape);
+  color: var(--tape-ink);
+  font: 600 .78rem/1 var(--mono);
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  padding: .5rem 1rem .45rem;
+  transform: rotate(-1.2deg);
+  clip-path: polygon(2% 0, 98% 4%, 100% 50%, 97% 100%, 1% 96%, 0 45%);
+}
+.section-head { display: grid; gap: 1rem; max-width: 44rem; margin-bottom: clamp(2rem, 5vw, 3rem); }
+.section-head h2 { font: 900 var(--step-3)/1 var(--display); letter-spacing: .01em; text-transform: uppercase; }
+.section-head p { color: var(--muted); font-size: var(--step-1); line-height: 1.5; }
+
+/* Top bar */
+.bar { padding-block: 1.25rem; display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+.mark { font: 900 1.6rem/1 var(--display); letter-spacing: .04em; text-transform: uppercase; color: var(--ink); text-decoration: none; }
+.bar nav { display: flex; gap: 1.25rem; flex-wrap: wrap; font-size: var(--step--1); }
+.bar nav a { color: var(--muted); text-decoration: none; }
+.bar nav a:hover { color: var(--ink); }
+
+/* Hero */
+.hero { position: relative; padding-block: clamp(2rem, 6vw, 4.5rem) clamp(3.5rem, 8vw, 6rem); overflow: hidden; }
+.hero::before {
+  content: ""; position: absolute; inset: -20% 0 auto 50%; width: 60rem; height: 60rem; translate: -20% 0;
+  background: radial-gradient(circle at center, var(--glow), transparent 55%);
+  pointer-events: none;
+}
+.hero-grid { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); gap: clamp(2rem, 5vw, 4rem); align-items: center; }
+.hero h1 { font: 900 var(--step-4)/.88 var(--display); text-transform: uppercase; letter-spacing: .005em; }
+.hero h1 em { font-style: normal; color: var(--floor); -webkit-text-stroke: 2px var(--ink); }
+.lede { margin-top: 1.5rem; font-size: var(--step-1); line-height: 1.5; color: var(--muted); max-width: 32rem; }
+.lede strong { color: var(--ink); font-weight: 600; }
+
+.install { margin-top: 2rem; display: grid; gap: .6rem; max-width: 32rem; }
+.install-label { font: 600 .75rem/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.cmd {
+  display: flex; align-items: stretch; border: 1px solid var(--ink); background: var(--floor-2); min-width: 0;
+}
+.cmd pre { margin: 0; padding: .85rem 1rem; overflow-x: auto; flex: 1; min-width: 0; font-size: .85rem; line-height: 1.55; }
+.cmd pre .p { color: var(--muted); user-select: none; }
+.copy {
+  border: 0; border-left: 1px solid var(--ink); background: var(--ink); color: var(--floor);
+  font: 600 .75rem/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; padding: 0 1rem; cursor: pointer; min-width: 5.5rem;
+}
+.copy:hover { background: var(--cue); }
+.needs { font-size: var(--step--1); color: var(--muted); }
+
+/* Terminal = the stage */
+.stage {
+  background: var(--stage); color: var(--stage-ink); border-radius: 6px; min-width: 0;
+  box-shadow: 0 30px 60px -30px rgba(0,0,0,.55), 0 0 0 1px rgba(255,255,255,.04) inset;
+}
+.stage-top { display: flex; align-items: center; gap: .5rem; padding: .7rem 1rem; border-bottom: 1px solid rgba(255,255,255,.07); font: 400 .72rem/1 var(--mono); color: var(--stage-dim); }
+.stage-top i { width: .6rem; height: .6rem; border-radius: 50%; background: #3a3f45; display: block; }
+.stage-top span { margin-left: auto; }
+.stage pre { margin: 0; padding: 1.1rem 1.2rem 1.3rem; overflow-x: auto; font-size: .76rem; line-height: 1.7; }
+.stage .d { color: var(--stage-dim); }
+.stage .j { color: #8fb4f2; }
+.stage .o { color: #79d39c; }
+.stage .w { color: #f0bd5e; }
+.stage .s { color: #e8eaec; font-weight: 600; }
+.cursor { display: inline-block; width: .55em; height: 1.1em; background: var(--stage-ink); vertical-align: text-bottom; animation: blink 1.1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+
+/* Cue sheet */
+.cues { border-top: 2px solid var(--ink); }
+.cue { display: grid; grid-template-columns: 4.5rem minmax(0, 22rem) minmax(0, 1fr); gap: 1.25rem; padding-block: 1rem; border-bottom: 1px solid var(--line); align-items: baseline; }
+.cue .n { font: 700 1.35rem/1 var(--display); color: var(--muted); letter-spacing: .04em; }
+.cue code { font-size: .88rem; overflow-x: auto; white-space: nowrap; display: block; min-width: 0; }
+.cue p { color: var(--muted); min-width: 0; }
+
+/* Repertoire */
+.rep { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0; border-top: 2px solid var(--ink); }
+.rep article { padding: 1.75rem 1.75rem 1.75rem 0; border-bottom: 1px solid var(--line); min-width: 0; }
+.rep article:nth-child(2n) { padding-left: 1.75rem; padding-right: 0; border-left: 1px solid var(--line); }
+.rep h3 { font: 700 var(--step-2)/1.05 var(--display); text-transform: uppercase; letter-spacing: .02em; margin-bottom: .9rem; }
+.rep ul { margin: 0; padding: 0; list-style: none; display: grid; gap: .55rem; }
+.rep li { padding-left: 1.1rem; position: relative; }
+.rep li::before { content: ""; position: absolute; left: 0; top: .62em; width: .5rem; height: 2px; background: var(--tape); box-shadow: 0 0 0 .5px var(--tape-ink); }
+.rep code { font-size: .84em; background: var(--floor-2); padding: .05em .3em; border-radius: 2px; }
+
+/* Stages */
+.stages { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1.25rem; }
+.venue { border: 1px solid var(--line); background: var(--floor-2); padding: 1.5rem; display: grid; gap: .9rem; align-content: start; min-width: 0; }
+.venue .flag { font: 600 .72rem/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.venue h3 { font: 900 1.9rem/1 var(--display); text-transform: uppercase; }
+.venue pre { margin: 0; font-size: .8rem; background: var(--floor); border: 1px solid var(--line); padding: .6rem .75rem; overflow-x: auto; }
+.venue p { color: var(--muted); font-size: .95rem; }
+.platform-note { margin-top: 1.75rem; color: var(--muted); max-width: 46rem; }
+.platform-note code { color: var(--ink); font-size: .9em; }
+
+/* Dashboard mock */
+.house { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr); gap: clamp(2rem, 5vw, 4rem); align-items: start; }
+.house-copy { display: grid; gap: 1rem; color: var(--muted); }
+.house-copy strong { color: var(--ink); }
+.house-copy code { color: var(--ink); font-size: .9em; }
+.mock { border: 1px solid var(--ink); background: var(--floor-2); min-width: 0; }
+.mock-top { display: flex; justify-content: space-between; gap: 1rem; padding: .6rem .9rem; border-bottom: 1px solid var(--line); font: 400 .72rem/1.3 var(--mono); color: var(--muted); flex-wrap: wrap; }
+.mock-body { padding: 1rem .9rem 1.2rem; overflow-x: auto; }
+.graph { display: grid; grid-template-columns: repeat(3, minmax(8.5rem, 1fr)); gap: .9rem; min-width: 28rem; }
+.col { display: grid; gap: .5rem; align-content: start; }
+.col h4 { margin: 0 0 .2rem; font: 600 .68rem/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.job { display: flex; align-items: center; gap: .5rem; background: var(--floor); border: 1px solid var(--line); padding: .5rem .6rem; font: 400 .78rem/1.2 var(--mono); }
+.job .dot { width: .6rem; height: .6rem; border-radius: 50%; flex: none; }
+.job .t { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+.dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); } .dot.skip { background: transparent; border: 1.5px solid var(--muted); }
+.job.bad { border-color: var(--bad); }
+.llm { margin-top: 1rem; display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; font-size: .8rem; color: var(--muted); }
+.llm span.btn { border: 1px solid var(--ink); padding: .35rem .65rem; color: var(--ink); font: 600 .72rem/1 var(--mono); letter-spacing: .04em; }
+
+/* Gaps */
+.gaps { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem 2.5rem; max-width: 60rem; }
+.gaps div { border-left: 3px solid var(--line); padding-left: 1rem; color: var(--muted); }
+.gaps strong { display: block; color: var(--ink); font-weight: 600; margin-bottom: .2rem; }
+.gaps code { font-size: .88em; }
+
+/* Curtain call */
+.call { background: var(--ink); color: var(--floor); border-top: 0; }
+.call .section-head p { color: color-mix(in srgb, var(--floor) 70%, var(--ink)); }
+.call .tape { color: var(--tape-ink); }
+.exits { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; border-top: 1px solid color-mix(in srgb, var(--floor) 25%, var(--ink)); }
+.exit { padding: 1.5rem 1.5rem 0 0; display: grid; gap: .5rem; }
+.exit + .exit { padding-left: 1.5rem; border-left: 1px solid color-mix(in srgb, var(--floor) 25%, var(--ink)); }
+.exit b { font: 900 4rem/1 var(--display); }
+.exit p { color: color-mix(in srgb, var(--floor) 72%, var(--ink)); }
+.exit:nth-child(1) b { color: var(--tape); }
+.foot { padding-block: 2rem; display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; font-size: var(--step--1); color: var(--muted); }
+
+@media (max-width: 860px) {
+  .hero-grid, .house { grid-template-columns: minmax(0, 1fr); }
+  .stages { grid-template-columns: minmax(0, 1fr); }
+  .rep { grid-template-columns: minmax(0, 1fr); }
+  .rep article, .rep article:nth-child(2n) { padding: 1.5rem 0; border-left: 0; }
+  .cue { grid-template-columns: 3rem minmax(0, 1fr); }
+  .cue p { grid-column: 2; }
+  .gaps { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 560px) {
+  .exits { grid-template-columns: minmax(0, 1fr); }
+  .exit, .exit + .exit { padding: 1.25rem 0; border-left: 0; border-bottom: 1px solid color-mix(in srgb, var(--floor) 25%, var(--ink)); }
+  .hero h1 em { -webkit-text-stroke-width: 1.5px; }
+}
+@media (prefers-reduced-motion: reduce) { .cursor { animation: none; } }
+</style>
+</head>
+<body>
+
+<header class="wrap bar">
+  <a class="mark" href="#top" id="top">runthrough</a>
+  <nav aria-label="Sections">
+    <a href="#cues">Usage</a>
+    <a href="#repertoire">What runs</a>
+    <a href="#stages">Platforms</a>
+    <a href="#house">Dashboard</a>
+    <a href="https://github.com/simota/runthrough">GitHub</a>
+  </nav>
+</header>
+
+<div class="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <h1>The full<br>rehearsal<br><em>before</em> you push</h1>
+      <p class="lede">A run-through is the last rehearsal before opening night. <strong>runthrough</strong> runs your GitHub Actions workflows on your own machine, in Docker, Apple <code>container</code> or straight on the host. It is an act-style runner shipped as one Rust binary.</p>
+      <div class="install">
+        <span class="install-label">Install with Homebrew</span>
+        <div class="cmd">
+          <pre id="install-cmd"><span class="p">$ </span>brew install simota/tap/runthrough</pre>
+          <button class="copy" id="copy-install" type="button" aria-label="Copy install command">Copy</button>
+        </div>
+        <p class="needs">Prebuilt for macOS and Linux, or <code>cargo install --path .</code> from a checkout. Needs <code>git</code>. Container jobs need Docker or Apple <code>container</code>. Host jobs use the shells you already have.</p>
+      </div>
+    </div>
+
+    <figure class="stage" style="margin:0" aria-label="Example terminal output of a runthrough run">
+      <div class="stage-top"><i></i><i></i><i></i><span>~/repos/runthrough · push</span></div>
+<pre><span class="d">$</span> <span class="s">runthrough</span>
+<span class="j">[build/build]</span> 🚀 start job on catthehacker/ubuntu:act-latest
+<span class="j">[build/build]</span> ⭐ Run actions/checkout@v4
+<span class="j">[build/build]</span>   <span class="o">✅ Run actions/checkout@v4 (0.1s)</span>
+<span class="j">[build/build]</span> ⭐ Run dtolnay/rust-toolchain@stable
+<span class="j">[build/build]</span>   <span class="d">| info: default toolchain set to 'stable'</span>
+<span class="j">[build/build]</span>   <span class="o">✅ Run dtolnay/rust-toolchain@stable (21.4s)</span>
+<span class="j">[build/build]</span> ⭐ Run cargo build
+<span class="j">[build/build]</span>   <span class="d">|    Finished `dev` profile in 38.02s</span>
+<span class="j">[build/build]</span>   <span class="o">✅ Run cargo build (38.6s)</span>
+<span class="j">[build/build]</span> ⭐ Run cargo test
+<span class="j">[build/build]</span>   <span class="d">| test result: ok. 40 passed; 0 failed</span>
+<span class="j">[build/build]</span>   <span class="o">✅ Run cargo test (52.3s)</span>
+<span class="j">[build/build]</span> 🏁 job success in 114.2s
+<span class="o">✅ build / build: success</span>
+<span class="d">$</span> <span class="cursor" aria-hidden="true"></span></pre>
+    </figure>
+  </div>
+</div>
+
+<section id="cues">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="tape">Cue sheet</span>
+      <h2>Call it from the wings</h2>
+      <p>Flags keep act's names, so <code>--matrix</code>, <code>--reuse</code>, <code>-j</code> and your <code>.actrc</code> carry over.</p>
+    </div>
+    <div class="cues">
+      <div class="cue"><span class="n">Q1</span><code>runthrough</code><p>Run every workflow triggered by <code>push</code>.</p></div>
+      <div class="cue"><span class="n">Q2</span><code>runthrough pull_request -j test</code><p>One job, plus the jobs it <code>needs</code>, for another event.</p></div>
+      <div class="cue"><span class="n">Q3</span><code>runthrough -l</code><p>List jobs by stage. <code>-n</code> shows the plan without running it.</p></div>
+      <div class="cue"><span class="n">Q4</span><code>runthrough --host</code><p>Run on the host instead of in containers.</p></div>
+      <div class="cue"><span class="n">Q5</span><code>runthrough --watch</code><p>Run again whenever a file changes.</p></div>
+      <div class="cue"><span class="n">Q6</span><code>runthrough --graph</code><p>Draw the job graph.</p></div>
+      <div class="cue"><span class="n">Q7</span><code>runthrough --validate --strict</code><p>Check the workflows, including unknown keys, then exit.</p></div>
+      <div class="cue"><span class="n">Q8</span><code>runthrough --dashboard</code><p>Browse recorded runs at <code>127.0.0.1:7766</code>.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="repertoire">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="tape">Repertoire</span>
+      <h2>Knows the whole script</h2>
+      <p>Workflows are read from <code>.github/workflows</code> and from <code>.runthrough/workflows</code>, for workflows you only run locally.</p>
+    </div>
+    <div class="rep">
+      <article>
+        <h3>Workflows &amp; jobs</h3>
+        <ul>
+          <li><code>needs</code> stages run their jobs in parallel; matrices with <code>include</code>, <code>exclude</code>, <code>fail-fast</code>, <code>max-parallel</code></li>
+          <li>Reusable workflows, local or <code>owner/repo/path@ref</code>, with typed inputs, <code>secrets: inherit</code> and outputs</li>
+          <li><code>on.&lt;event&gt;</code> filters for branches, tags, paths and types, checked against the event payload</li>
+          <li><code>concurrency</code>, <code>environment</code>, <code>timeout-minutes</code>, <code>continue-on-error</code></li>
+        </ul>
+      </article>
+      <article>
+        <h3>Steps &amp; actions</h3>
+        <ul>
+          <li>Composite, node and Docker actions with <code>pre</code>/<code>post</code>, plus <code>docker://</code> steps</li>
+          <li><code>bash</code>, <code>sh</code>, <code>python</code>, <code>pwsh</code>, <code>node</code> or a custom <code>{0}</code> shell</li>
+          <li><code>background</code>, <code>wait</code>, <code>wait-all</code>, <code>cancel</code> and <code>parallel</code> steps</li>
+          <li><code>actions/checkout</code> copies your working tree; other repositories are cloned</li>
+        </ul>
+      </article>
+      <article>
+        <h3>Expressions</h3>
+        <ul>
+          <li>Every operator, <code>.*</code> filters and the <code>github</code>, <code>env</code>, <code>vars</code>, <code>secrets</code>, <code>matrix</code>, <code>needs</code>, <code>steps</code> contexts</li>
+          <li><code>hashFiles</code>, <code>fromJSON</code>, <code>format</code>, <code>case</code>, <code>success()</code>, <code>failure()</code> and the rest</li>
+          <li><code>GITHUB_OUTPUT</code>, <code>GITHUB_ENV</code>, <code>GITHUB_STEP_SUMMARY</code>, workflow commands and problem matchers</li>
+          <li>Secrets and <code>::add-mask::</code> values print as <code>***</code></li>
+        </ul>
+      </article>
+      <article>
+        <h3>Props backstage</h3>
+        <ul>
+          <li>A built-in cache server for <code>actions/cache</code> and BuildKit's <code>type=gha</code> cache</li>
+          <li>An artifact server for <code>upload-artifact</code> / <code>download-artifact</code> v3 and v4</li>
+          <li>Service containers on a per-job network, reachable by name</li>
+          <li><code>setup-*</code> tools download once into a shared tool cache</li>
+        </ul>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section id="stages">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="tape">Venues</span>
+      <h2>Three stages to play on</h2>
+      <p><code>runs-on</code> labels map to an image or to the host. <code>ubuntu-*</code> defaults to <code>catthehacker/ubuntu:act-latest</code>.</p>
+    </div>
+    <div class="stages">
+      <div class="venue">
+        <span class="flag">Default</span>
+        <h3>Docker</h3>
+        <pre>runthrough</pre>
+        <p>Local or remote. With <code>DOCKER_HOST=ssh://…</code> job files live in volumes kept in sync with <code>docker cp</code>.</p>
+      </div>
+      <div class="venue">
+        <span class="flag">macOS 26+, Apple silicon</span>
+        <h3>Apple container</h3>
+        <pre>runthrough --engine container</pre>
+        <p>Runs on Apple's <code>container</code> after <code>container system start</code>. Services are written into the job's <code>/etc/hosts</code>.</p>
+      </div>
+      <div class="venue">
+        <span class="flag">No engine needed</span>
+        <h3>Host</h3>
+        <pre>runthrough --host</pre>
+        <p>Runs on your machine with your own tools. On macOS, <code>self-hosted</code> and <code>macos-*</code> labels run here by default.</p>
+      </div>
+    </div>
+    <p class="platform-note">Override any label with <code>-P ubuntu-latest=node:20-bookworm-slim</code>. Jobs get the engine socket only when asked: <code>--daemon-socket-job deploy</code> mounts <code>/var/run/docker.sock</code> into that job alone.</p>
+  </div>
+</section>
+
+<section id="house">
+  <div class="wrap house">
+    <div>
+      <div class="section-head" style="margin-bottom:1.5rem">
+        <span class="tape">House view</span>
+        <h2>Watch every run from the back row</h2>
+      </div>
+      <div class="house-copy">
+        <p>Every run is recorded with secrets masked, and <code>runthrough --dashboard</code> serves a local page laid out like GitHub's Actions tab. It shows the runs list, the job graph by stage with matrix legs and annotations, and each step's log, updated while a run is in progress.</p>
+        <p>A failed job has <strong>Copy for LLM</strong>, which copies the job's context and the last 200 lines of each failed step as Markdown.</p>
+        <p><strong>Resources</strong> lists the ports, containers, networks and volumes runthrough created, and flags the ones a finished run left behind.</p>
+      </div>
+    </div>
+    <figure class="mock" style="margin:0" aria-label="Sketch of the dashboard's job graph for a failed run">
+      <div class="mock-top"><span>ci · push · main @ 3af2a9f</span><span>Example run</span></div>
+      <div class="mock-body">
+        <div class="graph">
+          <div class="col">
+            <h4>Stage 0</h4>
+            <div class="job"><span class="dot ok"></span>lint<span class="t">0:41</span></div>
+            <div class="job"><span class="dot ok"></span>build<span class="t">1:54</span></div>
+          </div>
+          <div class="col">
+            <h4>Stage 1</h4>
+            <div class="job"><span class="dot ok"></span>test (18)<span class="t">0:37</span></div>
+            <div class="job"><span class="dot ok"></span>test (20)<span class="t">0:35</span></div>
+            <div class="job bad"><span class="dot bad"></span>test (22)<span class="t">0:12</span></div>
+          </div>
+          <div class="col">
+            <h4>Stage 2</h4>
+            <div class="job"><span class="dot skip"></span>deploy<span class="t">skipped</span></div>
+          </div>
+        </div>
+        <div class="llm"><span class="btn">Copy for LLM</span> test (22) · step "npm test" exited 1</div>
+      </div>
+    </figure>
+  </div>
+</section>
+
+<section id="gaps">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="tape">Understudies</span>
+      <h2>What stays different from GitHub</h2>
+      <p>A local rehearsal can't do everything the real stage does. These are the known gaps.</p>
+    </div>
+    <div class="gaps">
+      <div><strong>Cache service v2</strong>The <code>ACTIONS_CACHE_SERVICE_V2</code> API is not served. The v1 API is.</div>
+      <div><strong>Permissions</strong><code>permissions</code> is validated but has no local effect.</div>
+      <div><strong>Environments</strong>The name and <code>url</code> are reported. Environment secrets and protection rules are not applied.</div>
+      <div><strong>Concurrency</strong>Groups span a single <code>runthrough</code> invocation. A cancelled job stops before its next step.</div>
+    </div>
+  </div>
+</section>
+
+<section class="call" id="install">
+  <div class="wrap">
+    <div class="section-head">
+      <span class="tape">Curtain call</span>
+      <h2>Exit codes you can script</h2>
+      <p>Use runthrough as a pre-push hook or in your own scripts. Secrets come from <code>-s</code> or <code>.secrets</code>, variables from <code>--var</code> or <code>.vars</code>.</p>
+    </div>
+    <div class="exits">
+      <div class="exit"><b>0</b><p>Every job succeeded or was skipped.</p></div>
+      <div class="exit"><b>1</b><p>A job failed.</p></div>
+      <div class="exit"><b>2</b><p>runthrough itself failed: a bad workflow or a missing engine.</p></div>
+    </div>
+  </div>
+</section>
+
+<footer class="wrap foot">
+  <span>runthrough 0.1.0 · MIT license</span>
+  <a href="https://github.com/simota/runthrough">github.com/simota/runthrough</a>
+</footer>
+
+<script>
+document.getElementById('copy-install').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  const text = 'brew install simota/tap/runthrough';
+  try {
+    await navigator.clipboard.writeText(text);
+    btn.textContent = 'Copied';
+  } catch {
+    const range = document.createRange();
+    range.selectNodeContents(document.getElementById('install-cmd'));
+    const sel = getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    btn.textContent = 'Selected';
+  }
+  setTimeout(() => { btn.textContent = 'Copy'; }, 1800);
+});
+</script>
+</body>
+</html>

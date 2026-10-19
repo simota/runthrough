@@ -1,0 +1,7 @@
+on: push
+jobs:
+  x:
+    runs-on: ubuntu-latest
+    stesp: []
+    steps:
+      - run: echo ok

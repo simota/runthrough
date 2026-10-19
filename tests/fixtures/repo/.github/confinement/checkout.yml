@@ -1,0 +1,19 @@
+name: checkout-escape
+on: push
+jobs:
+  escape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          path: ../escape
+      - uses: actions/checkout@v4
+        continue-on-error: true
+        with:
+          repository: actions/hello-world-javascript-action
+          path: /tmp/runthrough-checkout-escape
+      - uses: actions/checkout@v4
+        with:
+          path: sub/../inside
+      - run: test -f inside/README.md && echo "inside checked out"

@@ -1,0 +1,12 @@
+name: called-concurrency
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+concurrency: ${{ github.workflow }}-${{ inputs.tag }}
+jobs:
+  inner:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "called workflow ran"
