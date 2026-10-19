@@ -5,8 +5,10 @@ A run-through is the full rehearsal before opening night. `runthrough` runs your
 ## Install
 
 ```sh
-brew install simota/tap/runthrough   # macOS and Linux, prebuilt binary
-cargo install --path .               # from a checkout
+brew tap simota/runthrough https://github.com/simota/runthrough   # macOS and Linux, prebuilt binary
+brew install runthrough
+
+cargo install --path .   # or build from a checkout
 ```
 
 Requires `git`. Container jobs need `docker` (or Apple's `container` with `--engine container`); host jobs (`--host`) run with whatever shells and tools the host has (`bash`, `node`, `python`, `pwsh`, …).

@@ -245,8 +245,9 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
       <div class="install">
         <span class="install-label">Install with Homebrew</span>
         <div class="cmd">
-          <pre id="install-cmd"><span class="p">$ </span>brew install simota/tap/runthrough</pre>
-          <button class="copy" id="copy-install" type="button" aria-label="Copy install command">Copy</button>
+          <pre id="install-cmd"><span class="p">$ </span>brew tap simota/runthrough https://github.com/simota/runthrough
+<span class="p">$ </span>brew install runthrough</pre>
+          <button class="copy" id="copy-install" type="button" aria-label="Copy install commands">Copy</button>
         </div>
         <p class="needs">Prebuilt for macOS and Linux, or <code>cargo install --path .</code> from a checkout. Needs <code>git</code>. Container jobs need Docker or Apple <code>container</code>. Host jobs use the shells you already have.</p>
       </div>
@@ -451,7 +452,7 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
 <script>
 document.getElementById('copy-install').addEventListener('click', async (e) => {
   const btn = e.currentTarget;
-  const text = 'brew install simota/tap/runthrough';
+  const text = 'brew tap simota/runthrough https://github.com/simota/runthrough\nbrew install runthrough';
   try {
     await navigator.clipboard.writeText(text);
     btn.textContent = 'Copied';
