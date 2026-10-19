@@ -6,6 +6,7 @@ A run-through is the full rehearsal before opening night. `runthrough` runs your
 
 ```sh
 brew tap simota/runthrough https://github.com/simota/runthrough   # macOS and Linux, prebuilt binary
+brew trust --formula simota/runthrough/runthrough               # Homebrew 7+ loads third-party formulae only once trusted
 brew install runthrough
 
 cargo install --path .   # or build from a checkout
