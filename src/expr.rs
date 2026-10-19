@@ -885,6 +885,20 @@ fn interpolate_tree(v: &Value, ctx: &Ctx, splice: bool) -> Result<Value> {
     })
 }
 
+/// Whether `node` calls a status function; one named only inside a string
+/// literal (`contains(msg, 'always(')`) does not count.
+fn calls_status(node: &Node) -> bool {
+    match node {
+        Node::Call(name, args) => {
+            ["success", "failure", "always", "cancelled"].contains(&name.as_str())
+                || args.iter().any(calls_status)
+        }
+        Node::Prop(n, _) | Node::Filter(n) | Node::Not(n) => calls_status(n),
+        Node::Index(a, b) | Node::Bin(_, a, b) => calls_status(a) || calls_status(b),
+        Node::Lit(_) | Node::Ident(_) => false,
+    }
+}
+
 fn succeeded(ctx: &Ctx) -> bool {
     !ctx.failed && !ctx.ancestor_unsucceeded && !ctx.cancelled
 }
@@ -900,11 +914,8 @@ pub fn evaluate_if(cond: Option<&str>, ctx: &Ctx) -> Result<bool> {
         _ if raw.contains("${{") => format!("'{}'", interpolate(raw, ctx)?.replace('\'', "''")),
         _ => raw.to_string(),
     };
-    let lowered = body.to_ascii_lowercase();
-    let has_status = ["success(", "failure(", "always(", "cancelled("]
-        .iter()
-        .any(|f| lowered.contains(f));
-    let full = if has_status {
+    let node = parse(&body).map_err(|e| anyhow!("{e} (in expression `{}`)", body.trim()))?;
+    let full = if calls_status(&node) {
         body
     } else {
         format!("success() && ({body})")
@@ -1103,5 +1114,9 @@ mod tests {
         assert!(!evaluate_if(Some("true"), &c).unwrap());
         assert!(evaluate_if(Some("failure()"), &c).unwrap());
         assert!(evaluate_if(Some("always()"), &c).unwrap());
+        assert!(evaluate_if(Some("ALWAYS() && true"), &c).unwrap());
+        // A status function named in a string is no call: `success() &&` still applies.
+        assert!(!evaluate_if(Some("contains('x always() y', 'always(')"), &c).unwrap());
+        assert!(!evaluate_if(Some("'failure()' != ''"), &c).unwrap());
     }
 }

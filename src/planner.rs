@@ -73,6 +73,11 @@ pub fn expand_matrix(matrix: &Value) -> Result<Vec<Map<String, Value>>> {
         let Value::Array(vals) = vals else {
             bail!("matrix key '{key}' must be a list")
         };
+        // As on GitHub (`fromJSON` of an empty list included): the job fails
+        // instead of running once without a matrix.
+        if vals.is_empty() {
+            bail!("matrix vector '{key}' does not contain any values");
+        }
         has_dims = true;
         let mut next = Vec::new();
         for c in &combos {
@@ -203,5 +208,14 @@ mod tests {
     #[test]
     fn no_matrix() {
         assert_eq!(expand_matrix(&Value::Null).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_empty_vector_is_an_error() {
+        let e = expand_matrix(&json!({"os": [], "include": [{"os": "x"}]})).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "matrix vector 'os' does not contain any values"
+        );
     }
 }
