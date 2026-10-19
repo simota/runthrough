@@ -1612,3 +1612,23 @@ fn continue_on_error_is_evaluated_per_matrix_leg() {
     assert!(stdout.contains("mx / m: success"), "{stdout}");
     assert!(stdout.contains("| after ran"), "{stdout}");
 }
+
+#[test]
+fn run_name_does_not_print_a_secret() {
+    let repo = TempRepo::new();
+    repo.workflow(
+        "rn.yml",
+        "name: rn\nrun-name: run ${{ secrets.LONG }}\non: push\njobs:\n  j:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"long=$LONG\"\n        env:\n          LONG: ${{ secrets.LONG }}\n",
+    );
+    let out = repo.run(&[
+        "--host",
+        "--no-cache-server",
+        "-s",
+        "SHORT=pass",
+        "-s",
+        "LONG=mypassword123",
+    ]);
+    assert!(out.contains("rn: run ***"), "{out}");
+    assert!(out.contains("| long=***"), "{out}");
+    assert!(!out.contains("word123"), "{out}");
+}

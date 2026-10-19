@@ -540,6 +540,9 @@ pub fn run_workflow(wf: &Workflow, cfg: &Config, only: Option<&str>) -> Result<b
     if let Some(run_name) = &wf.run_name {
         let ctx = base_ctx(wf, cfg, &json!({}), &Map::new());
         let run_name = expr::interpolate(run_name, &ctx)?;
+        // GitHub refuses `secrets` in run-name; here it must at least not print one.
+        let log = Logger::new(&wf.display_name(), "run-name", cfg);
+        let run_name = commands::mask(&run_name, &log.masks.lock().unwrap());
         if let Some(h) = &cfg.shared.history {
             h.record(json!({"wf": wf.display_name(), "run_name": run_name}));
         }

@@ -109,19 +109,50 @@ fn unescape_data(s: &str) -> String {
         .replace("%25", "%")
 }
 
+/// Like GitHub, `%25` is decoded last: `%253A` is a literal `%3A`.
 fn unescape_prop(s: &str) -> String {
-    unescape_data(s).replace("%3A", ":").replace("%2C", ",")
+    s.replace("%0D", "\r")
+        .replace("%0A", "\n")
+        .replace("%3A", ":")
+        .replace("%2C", ",")
+        .replace("%25", "%")
 }
 
-/// Replace every secret / masked value with `***`.
+/// Replace every secret / masked value with `***`. Like GitHub's runner, the
+/// values are all found in the line first and overlapping ones merged, so a
+/// shorter mask registered earlier cannot leave the rest of a longer one shown.
 pub fn mask(line: &str, masks: &[String]) -> String {
-    let mut out = line.to_string();
-    // Most lines hold no secret: only a value that occurs costs a copy.
-    for m in masks {
-        if !m.is_empty() && out.contains(m.as_str()) {
-            out = out.replace(m.as_str(), "***");
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    for m in masks.iter().filter(|m| !m.is_empty()) {
+        let mut from = 0;
+        while let Some(i) = line[from..].find(m.as_str()) {
+            let start = from + i;
+            hits.push((start, start + m.len()));
+            // Overlapping occurrences too: `aaa` holds `aa` twice.
+            from = start + line[start..].chars().next().map_or(1, char::len_utf8);
         }
     }
+    // Most lines hold no secret.
+    if hits.is_empty() {
+        return line.to_string();
+    }
+    hits.sort_unstable();
+    let mut out = String::with_capacity(line.len());
+    let mut copied = 0;
+    let mut hits = hits.into_iter().peekable();
+    while let Some((start, mut end)) = hits.next() {
+        while let Some(&(s, e)) = hits.peek() {
+            if s > end {
+                break;
+            }
+            end = end.max(e);
+            hits.next();
+        }
+        out.push_str(&line[copied..start]);
+        out.push_str("***");
+        copied = end;
+    }
+    out.push_str(&line[copied..]);
     out
 }
 
@@ -156,6 +187,10 @@ mod tests {
                 message: "bad\nthing".into()
             })
         );
+        assert_eq!(
+            parse_command("::set-output name=a%253Ab::v"),
+            Some(Command::SetOutput("a%3Ab".into(), "v".into()))
+        );
         assert_eq!(parse_command("plain output"), None);
         assert_eq!(
             parse_command("::add-matcher::/x/tsc.json"),
@@ -181,8 +216,16 @@ mod tests {
     #[test]
     fn masking() {
         assert_eq!(mask("token=abc123 ok", &["abc123".into()]), "token=*** ok");
-        // Masks still apply in order: an earlier one can hide part of a later one.
-        assert_eq!(mask("abcd bcd", &["abc".into(), "bcd".into()]), "***d ***");
+        // Overlapping values are hidden as one, whatever their order.
+        assert_eq!(mask("abcd bcd", &["abc".into(), "bcd".into()]), "*** ***");
+        assert_eq!(
+            mask(
+                "long=mypassword123",
+                &["pass".into(), "mypassword123".into()]
+            ),
+            "long=***"
+        );
+        assert_eq!(mask("aaaa é aa", &["aa".into()]), "*** é ***");
         assert_eq!(mask("no secret here", &["abc".into()]), "no secret here");
     }
 }
