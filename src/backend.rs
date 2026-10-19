@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use indexmap::IndexMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -58,7 +58,8 @@ impl Engine {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
-    /// Fail with a clear message when the engine's daemon is not running, instead
+    /// Fail with a clear message when the engine's daemon is not running (or does
+    /// not answer within `PROBE_TIMEOUT`), instead
     /// of on the first pull. Only success is remembered, so a `--watch` rerun
     /// after starting the engine probes again.
     pub fn ensure_running(self) -> Result<()> {
@@ -66,34 +67,60 @@ impl Engine {
         if RUNNING.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let (args, hint): (&[&str], _) = match self {
+        let args: &[&str] = match self {
+            Engine::Docker => &["version", "--format", "{{.Server.Version}}"],
+            Engine::Container => &["system", "status"],
+        };
+        let mut cmd = self.command();
+        cmd.args(args);
+        self.check(cmd, PROBE_TIMEOUT)?;
+        RUNNING.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// `ensure_running`'s verdict on the probe `cmd`.
+    fn check(self, cmd: Command, timeout: Duration) -> Result<()> {
+        let (hint, hung_hint) = match self {
             Engine::Docker => (
-                &["version", "--format", "{{.Server.Version}}"],
                 "start Docker Desktop (or the Docker daemon), or run the jobs on the host with --host",
+                "restart Docker Desktop (or the Docker daemon), or run the jobs on the host with --host",
             ),
             Engine::Container => (
-                &["system", "status"],
                 "start it with `container system start`, or run the jobs on the host with --host",
+                "restart it with `container system stop` and `container system start`, or run the jobs on the host with --host",
             ),
         };
-        let out = self.command().args(args).output().with_context(|| {
+        let probe = format!(
+            "{} {}",
+            self.program(),
+            cmd.get_args()
+                .map(|a| a.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let out = output_within(cmd, timeout).with_context(|| {
             format!(
                 "running `{}` (is it installed and on PATH?)",
                 self.program()
             )
         })?;
+        let Some(out) = out else {
+            bail!(
+                "the {} engine did not answer `{probe}` within {}s and may be hung: {hung_hint}",
+                self.program(),
+                timeout.as_secs_f64()
+            );
+        };
         if !out.status.success() {
             let mut err = String::from_utf8_lossy(&out.stderr).trim().to_string();
             if err.is_empty() {
                 err = String::from_utf8_lossy(&out.stdout).trim().to_string();
             }
             bail!(
-                "the {program} engine is not running: {hint}\n  `{program} {}`: {err}",
-                args.join(" "),
-                program = self.program()
+                "the {} engine is not running: {hint}\n  `{probe}`: {err}",
+                self.program()
             );
         }
-        RUNNING.store(true, Ordering::Relaxed);
         Ok(())
     }
 
@@ -928,6 +955,31 @@ const HOST_GROUP_WRAPPER: &str = "p=$$; exec 3<&0; \
 (read -r _ <&3; kill -0 $p 2>/dev/null && kill -TERM 0) </dev/null >/dev/null 2>&1 & \
 exec \"$@\" </dev/null 3<&-";
 
+/// How long the engine may take to answer `ensure_running`'s probe. A daemon
+/// that is up answers at once; a hung one (Docker Desktop whose VM stopped
+/// responding) never does, and every job would wait on it without a word.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `cmd`'s output, or `None` (the command killed) once it runs past `timeout`.
+/// Its output is read after it exits, so it must fit a pipe: a short status.
+fn output_within(mut cmd: Command, timeout: Duration) -> std::io::Result<Option<Output>> {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + timeout;
+    while child.try_wait()?.is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    child.wait_with_output().map(Some)
+}
+
 /// Lines a step's output may run ahead of their handling: past it the readers
 /// wait, and so does the command writing to the pipe.
 const PENDING_LINES: usize = 1024;
@@ -971,6 +1023,39 @@ fn pump(child: &mut Child) -> mpsc::Receiver<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_engine_probe_fails_instead_of_waiting() {
+        let sh = |script: &str| {
+            let mut c = Command::new("sh");
+            c.args(["-c", script]);
+            c
+        };
+        let started = Instant::now();
+        let e = Engine::Docker
+            .check(sh("sleep 30"), Duration::from_millis(300))
+            .unwrap_err()
+            .to_string();
+        assert!(started.elapsed() < Duration::from_secs(5), "{e}");
+        assert!(
+            e.contains("did not answer `docker -c sleep 30` within 0.3s"),
+            "{e}"
+        );
+        assert!(e.contains("restart Docker Desktop"), "{e}");
+        let e = Engine::Docker
+            .check(
+                sh("echo 'cannot connect' >&2; exit 1"),
+                Duration::from_secs(5),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("engine is not running"), "{e}");
+        assert!(e.contains("cannot connect"), "{e}");
+        assert!(Engine::Docker
+            .check(sh("echo 27.0"), Duration::from_secs(5))
+            .is_ok());
+    }
 
     fn piped(script: &str) -> Child {
         Command::new("sh")
