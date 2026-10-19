@@ -82,7 +82,7 @@ The cache service v2 API (`ACTIONS_CACHE_SERVICE_V2`). `permissions` and `jobs.<
 - **Apple `container`** (`--engine container`; macOS 26+, Apple silicon, after `container system start`).
 - **Host** (`--host`, or a label mapped to `-self-hosted`).
 
-Job containers get no engine socket unless asked: `--daemon-socket-job <job>` mounts `/var/run/docker.sock` into that job only (for `docker compose` or `docker build` steps), `--container-daemon-socket <path>` into every job. A step that fails to reach the socket is told which flag to pass. A container job fails with a hint before its first pull when the engine is not running.
+Job containers get no engine socket unless asked: `--daemon-socket-job <job>` mounts `/var/run/docker.sock` into that job only (for `docker compose` or `docker build` steps), `--container-daemon-socket <path>` into every job. A step that fails to reach the socket is told which flag to pass. A container job fails with a hint before its first pull when the engine is not running, or does not answer within 30 seconds (a hung Docker Desktop).
 
 `--container-options` appends options to every job container's `run` (e.g. `--container-options '--dns 1.1.1.1'` when name resolution fails inside Apple containers).
 

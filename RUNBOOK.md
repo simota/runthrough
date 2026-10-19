@@ -34,6 +34,7 @@ With `--engine container`, use `container list --all` and `container delete --fo
 |---|---|
 | Exit code `2`, `error: …` | runthrough itself failed (workflow did not validate, engine not found, …); the message says which. `runthrough --validate --strict` checks workflows alone |
 | `the docker engine is not running: …` (or `the container engine …`) | Start Docker Desktop or the daemon (`container system start` for `--engine container`), or run on the host with `--host` |
+| ``the docker engine did not answer `docker version …` within 30s and may be hung`` | The daemon is up but stuck (`docker version` hangs too): restart Docker Desktop or the daemon (`container system stop` then `start` for `--engine container`), or run on the host with `--host` |
 | A step cannot reach `unix:///var/run/docker.sock` | Job containers get no engine socket by default. Pass `--daemon-socket-job <job>` (or `--container-daemon-socket <path>` for every job) |
 | A service fails to start because its host port is taken | The error names the container publishing that port; stop it (often a leftover, see [Cleanup](#cleanup)) or change the service's `ports` |
 | A workflow does not run for the event | Its `on.<event>` filters (`branches`, `paths`, `types`, …) rejected the payload. Pass a matching payload with `-e`, or run it directly with `-W <file>` or `-j <job>`, which skip the filters |
