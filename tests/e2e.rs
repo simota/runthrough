@@ -1558,3 +1558,57 @@ fn continue_on_error_keeps_a_skipped_job_skipped() {
     assert!(stdout.contains("skipped / after: skipped"), "{stdout}");
     assert!(!stdout.contains("after ran"), "{stdout}");
 }
+
+#[test]
+fn job_status_functions_see_every_ancestor() {
+    // As on GitHub: a failed ancestor two levels up still fails `success()`,
+    // and a skipped one fails `success()` without making `failure()` true.
+    let repo = TempRepo::new();
+    let job = |id: &str, extra: &str, run: &str| {
+        format!("  {id}:\n{extra}    runs-on: ubuntu-latest\n    steps:\n      - run: {run}\n")
+    };
+    repo.workflow(
+        "chain.yml",
+        &[
+            "name: chain\non: push\njobs:\n".to_string(),
+            job("a", "", "exit 1"),
+            job("b", "    needs: a\n    if: always()\n", "echo b"),
+            job("c", "    needs: b\n", "echo c ran"),
+            job("d", "    needs: b\n    if: failure()\n", "echo d ran"),
+            job("s", "    if: false\n", "echo s"),
+            job("t", "    needs: s\n    if: failure()\n", "echo t ran"),
+        ]
+        .concat(),
+    );
+    let out = repo.run(&["--host", "--no-cache-server"]);
+    assert!(out.contains("chain / c: skipped"), "{out}");
+    assert!(out.contains("chain / d: success"), "{out}");
+    assert!(out.contains("| d ran"), "{out}");
+    assert!(out.contains("chain / t: skipped"), "{out}");
+    assert!(
+        !out.contains("| c ran") && !out.contains("| t ran"),
+        "{out}"
+    );
+}
+
+#[test]
+fn continue_on_error_is_evaluated_per_matrix_leg() {
+    // GitHub's `experimental` pattern: the tolerated leg neither fails the job
+    // nor cancels its sibling through fail-fast.
+    let repo = TempRepo::new();
+    repo.workflow(
+        "mx.yml",
+        "name: mx\non: push\njobs:\n  m:\n    runs-on: ubuntu-latest\n    continue-on-error: ${{ matrix.experimental == true }}\n    strategy:\n      matrix:\n        v: [1, 2]\n        include:\n          - v: 2\n            experimental: true\n    steps:\n      - run: '[ \"${{ matrix.v }}\" = 1 ] && sleep 1 && echo leg one done || exit 1'\n  after:\n    needs: m\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo after ran\n",
+    );
+    let out = bin()
+        .arg("-C")
+        .arg(repo.path())
+        .args(["--host", "--no-cache-server"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("| leg one done"), "{stdout}");
+    assert!(stdout.contains("mx / m: success"), "{stdout}");
+    assert!(stdout.contains("| after ran"), "{stdout}");
+}
