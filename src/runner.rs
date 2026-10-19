@@ -729,6 +729,19 @@ fn yaml_minutes(v: Option<&Yaml>, ctx: &Ctx) -> Result<Option<Duration>> {
     Ok(Some(Duration::from_secs_f64(mins * 60.0)))
 }
 
+/// The jobs `id` needs, directly or through other jobs.
+fn ancestors(wf: &Workflow, id: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    let mut todo = wf.jobs[id].needs();
+    while let Some(n) = todo.pop() {
+        if !found.contains(&n) {
+            todo.extend(wf.jobs[&n].needs());
+            found.push(n);
+        }
+    }
+    found
+}
+
 fn run_job_matrix(
     wf: &Workflow,
     cfg: &Config,
@@ -748,8 +761,13 @@ fn run_job_matrix(
         .collect();
     let needs = Value::Object(needs);
     let mut ctx = base_ctx(wf, cfg, &needs, typed_inputs);
-    ctx.failed = job
-        .needs()
+    // Like GitHub, a job's status functions see every ancestor, not only its
+    // direct needs; only a failed one makes `failure()` true.
+    let ancestors = ancestors(wf, id);
+    ctx.failed = ancestors
+        .iter()
+        .any(|n| done[n].result == JobResult::Failure);
+    ctx.ancestor_unsucceeded = ancestors
         .iter()
         .any(|n| done[n].result != JobResult::Success);
 
@@ -802,7 +820,7 @@ fn run_job_matrix(
             let mut leg_ctx = ctx.clone();
             leg_ctx.set("matrix", Value::Object(combo.clone()));
             leg_ctx.set("strategy", strategy_ctx.clone());
-            let out = match concurrency_spec(&job.concurrency, &leg_ctx) {
+            let mut out = match concurrency_spec(&job.concurrency, &leg_ctx) {
                 Ok(spec) => with_concurrency(cfg, spec, &log, |cfg| match &job.uses {
                     Some(uses) => run_reusable(wf, cfg, id, uses, combo, ctx.clone()),
                     None => run_job(wf, cfg, id, combo, strategy_ctx, ctx.clone(), &cancel),
@@ -813,6 +831,16 @@ fn run_job_matrix(
                     JobOutcome::new(JobResult::Failure)
                 }
             };
+            // Only a failure is forgiven, per leg (`continue-on-error:
+            // ${{ matrix.experimental }}`), and a forgiven one does not fail
+            // fast: a skipped or cancelled leg stays so.
+            if out.result == JobResult::Failure {
+                match yaml_bool(&job.continue_on_error, &leg_ctx) {
+                    Ok(true) => out.result = JobResult::Success,
+                    Ok(false) => {}
+                    Err(e) => log.line(&format!("❌ continue-on-error: {e:#}")),
+                }
+            }
             if out.result == JobResult::Failure && fail_fast {
                 cancel.store(true, Ordering::SeqCst);
             }
@@ -833,11 +861,6 @@ fn run_job_matrix(
                 merged.result = o.result;
             }
             merged.outputs.extend(o.outputs);
-        }
-        // Only a failure is forgiven: a skipped or cancelled job stays so, and
-        // so do the jobs that need it.
-        if merged.result == JobResult::Failure && yaml_bool(&job.continue_on_error, &ctx)? {
-            merged.result = JobResult::Success;
         }
         Ok(merged)
     })();
@@ -2670,6 +2693,7 @@ impl<'a> JobRun<'a> {
         job["status"] = json!(if scope.failed { "failure" } else { "success" });
         ctx.set("job", job);
         ctx.failed = scope.failed;
+        ctx.ancestor_unsucceeded = false;
         ctx.cancelled = self.cancelled();
         ctx
     }

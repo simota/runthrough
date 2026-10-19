@@ -14,6 +14,9 @@ pub struct Ctx {
     pub contexts: Map<String, Value>,
     /// Whether a previous step/job in scope has failed.
     pub failed: bool,
+    /// Whether an ancestor job ended without succeeding (skipped or
+    /// cancelled): `success()` is false, though `failure()` need not be true.
+    pub ancestor_unsucceeded: bool,
     pub cancelled: bool,
     /// Workspace root for `hashFiles`.
     pub workspace: Option<PathBuf>,
@@ -585,7 +588,7 @@ fn call(name: &str, args: &[Node], ctx: &Ctx) -> Result<Value> {
     match name {
         "success" => {
             argc(0, 0)?;
-            Ok(Value::Bool(!ctx.failed && !ctx.cancelled))
+            Ok(Value::Bool(succeeded(ctx)))
         }
         "failure" => {
             argc(0, 0)?;
@@ -882,11 +885,15 @@ fn interpolate_tree(v: &Value, ctx: &Ctx, splice: bool) -> Result<Value> {
     })
 }
 
+fn succeeded(ctx: &Ctx) -> bool {
+    !ctx.failed && !ctx.ancestor_unsucceeded && !ctx.cancelled
+}
+
 /// Evaluate an `if:` condition. Without a status function it is implicitly `success() && (...)`.
 pub fn evaluate_if(cond: Option<&str>, ctx: &Ctx) -> Result<bool> {
     let raw = cond.map(str::trim).unwrap_or("");
     if raw.is_empty() {
-        return Ok(!ctx.failed && !ctx.cancelled);
+        return Ok(succeeded(ctx));
     }
     let body = match raw.strip_prefix("${{").and_then(|r| r.strip_suffix("}}")) {
         Some(inner) if !inner.contains("${{") => inner.to_string(),
