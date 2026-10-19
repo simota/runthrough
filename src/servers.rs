@@ -17,7 +17,7 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -79,26 +79,27 @@ impl Response {
 
 fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
+    let hex = |c: u8| (c as char).to_digit(16);
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        match b[i] {
-            b'%' if i + 2 < b.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                Ok(v) => {
-                    out.push(v);
-                    i += 3;
-                    continue;
-                }
-                Err(_) => out.push(b'%'),
-            },
-            c => out.push(c),
+        // Decoded on bytes: a `%` before a multibyte character is kept as is.
+        if let (b'%', Some(hi), Some(lo)) = (
+            b[i],
+            b.get(i + 1).copied().and_then(hex),
+            b.get(i + 2).copied().and_then(hex),
+        ) {
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+            continue;
         }
+        out.push(b[i]);
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn read_request(reader: &mut BufReader<TcpStream>) -> Result<Option<Request>> {
+fn read_request(reader: &mut impl BufRead) -> Result<Option<Request>> {
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
         return Ok(None);
@@ -142,15 +143,12 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Result<Option<Request>> {
                 reader.read_line(&mut end)?;
                 break;
             }
-            let start = body.len();
-            body.resize(start + n, 0);
-            reader.read_exact(&mut body[start..])?;
+            read_body(reader, &mut body, n)?;
             let mut crlf = [0u8; 2];
             reader.read_exact(&mut crlf)?;
         }
     } else if let Some(n) = headers.get("content-length") {
-        body.resize(n.parse()?, 0);
-        reader.read_exact(&mut body)?;
+        read_body(reader, &mut body, n.parse()?)?;
     }
     Ok(Some(Request {
         method: method.to_string(),
@@ -159,6 +157,21 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> Result<Option<Request>> {
         headers,
         body,
     }))
+}
+
+/// Append `n` bytes of body to `body`, growing it only as bytes arrive: a
+/// length the client announces but never sends must not be allocated up front
+/// (a failed allocation aborts the whole process, not just this thread).
+fn read_body(reader: &mut impl BufRead, body: &mut Vec<u8>, n: usize) -> Result<()> {
+    let start = body.len();
+    reader.take(n as u64).read_to_end(body)?;
+    if body.len() - start != n {
+        bail!(
+            "request body ended after {} of {n} bytes",
+            body.len() - start
+        );
+    }
+    Ok(())
 }
 
 fn write_response(stream: &mut impl Write, r: &Response) -> std::io::Result<()> {
@@ -1402,6 +1415,30 @@ mod tests {
         assert_eq!(rfc3339_now().len(), 20);
         assert_eq!(percent_decode("a%2Bb%3D%3D"), "a+b==");
         assert_eq!(base64url(b"\xfb\xff"), "-_8");
+        // A `%` before a multibyte character is kept, not sliced through.
+        assert_eq!(percent_decode("%a\u{e9}"), "%a\u{e9}");
+        assert_eq!(percent_decode("%\u{e9}1"), "%\u{e9}1");
+    }
+
+    #[test]
+    fn a_body_is_allocated_as_it_arrives_not_as_announced() {
+        let read = |raw: &str| read_request(&mut std::io::Cursor::new(raw.as_bytes().to_vec()));
+        let req = read("PUT /x HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc")
+            .unwrap()
+            .unwrap();
+        assert_eq!(req.body, b"abc");
+        let req = read(
+            "PUT /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n1\r\nc\r\n0\r\n\r\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(req.body, b"abc");
+        // A length the client never sends is an error, not a 100 TB allocation.
+        assert!(read("PUT /x HTTP/1.1\r\nContent-Length: 100000000000000\r\n\r\nabc").is_err());
+        assert!(
+            read("PUT /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffff\r\nabc")
+                .is_err()
+        );
     }
 
     #[test]
