@@ -732,19 +732,6 @@ fn yaml_minutes(v: Option<&Yaml>, ctx: &Ctx) -> Result<Option<Duration>> {
     Ok(Some(Duration::from_secs_f64(mins * 60.0)))
 }
 
-/// The jobs `id` needs, directly or through other jobs.
-fn ancestors(wf: &Workflow, id: &str) -> Vec<String> {
-    let mut found: Vec<String> = Vec::new();
-    let mut todo = wf.jobs[id].needs();
-    while let Some(n) = todo.pop() {
-        if !found.contains(&n) {
-            todo.extend(wf.jobs[&n].needs());
-            found.push(n);
-        }
-    }
-    found
-}
-
 fn run_job_matrix(
     wf: &Workflow,
     cfg: &Config,
@@ -766,7 +753,8 @@ fn run_job_matrix(
     let mut ctx = base_ctx(wf, cfg, &needs, typed_inputs);
     // Like GitHub, a job's status functions see every ancestor, not only its
     // direct needs; only a failed one makes `failure()` true.
-    let ancestors = ancestors(wf, id);
+    let mut ancestors = planner::with_needs(wf, id);
+    ancestors.shift_remove(id);
     ctx.failed = ancestors
         .iter()
         .any(|n| done[n].result == JobResult::Failure);
