@@ -39,7 +39,7 @@ jobs:
         run: |
           archive="runthrough-${GITHUB_REF_NAME#v}-${{ matrix.target }}.tar.gz"
           mkdir dist
-          tar -czf "dist/$archive" -C target/${{ matrix.target }}/release runthrough -C "$GITHUB_WORKSPACE" README.md
+          tar -czf "dist/$archive" -C target/${{ matrix.target }}/release runthrough -C "$GITHUB_WORKSPACE" README.md LICENSE
           (cd dist && shasum -a 256 "$archive" > "$archive.sha256")
       - uses: actions/upload-artifact@v4
         with:
