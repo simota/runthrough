@@ -914,13 +914,14 @@ pub fn evaluate_if(cond: Option<&str>, ctx: &Ctx) -> Result<bool> {
         _ if raw.contains("${{") => format!("'{}'", interpolate(raw, ctx)?.replace('\'', "''")),
         _ => raw.to_string(),
     };
-    let node = parse(&body).map_err(|e| anyhow!("{e} (in expression `{}`)", body.trim()))?;
-    let full = if calls_status(&node) {
-        body
-    } else {
-        format!("success() && ({body})")
-    };
-    Ok(truthy(&evaluate(&full, ctx)?))
+    let in_expr = |e: anyhow::Error| anyhow!("{e} (in expression `{}`)", body.trim());
+    let node = parse(&body).map_err(in_expr)?;
+    // Without a status function it is `success() && (...)`, which evaluates
+    // nothing more once a step or job has not succeeded.
+    if !calls_status(&node) && !succeeded(ctx) {
+        return Ok(false);
+    }
+    Ok(truthy(&eval(&node, ctx).map_err(in_expr)?))
 }
 
 #[cfg(test)]

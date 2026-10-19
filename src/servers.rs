@@ -164,6 +164,9 @@ fn read_request(reader: &mut impl BufRead) -> Result<Option<Request>> {
 /// (a failed allocation aborts the whole process, not just this thread).
 fn read_body(reader: &mut impl BufRead, body: &mut Vec<u8>, n: usize) -> Result<()> {
     let start = body.len();
+    // Uploads come in chunks of a few MB: reserve that much at once, and grow
+    // past it only for bytes that really arrive.
+    body.reserve(n.min(64 << 20));
     reader.take(n as u64).read_to_end(body)?;
     if body.len() - start != n {
         bail!(

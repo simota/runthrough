@@ -5,6 +5,18 @@ use anyhow::{bail, Result};
 use indexmap::IndexSet;
 use serde_json::{Map, Value};
 
+/// `id` and every job it needs, directly or through other jobs.
+pub fn with_needs(wf: &Workflow, id: &str) -> IndexSet<String> {
+    let mut found = IndexSet::new();
+    let mut todo = vec![id.to_string()];
+    while let Some(j) = todo.pop() {
+        if found.insert(j.clone()) {
+            todo.extend(wf.jobs[&j].needs());
+        }
+    }
+    found
+}
+
 /// Group jobs into stages; every job's `needs` are in earlier stages.
 /// When `only` is given, that job and its transitive dependencies are planned.
 pub fn stages(wf: &Workflow, only: Option<&str>) -> Result<Vec<Vec<String>>> {
@@ -21,12 +33,7 @@ pub fn stages(wf: &Workflow, only: Option<&str>) -> Result<Vec<Vec<String>>> {
             if !wf.jobs.contains_key(target) {
                 bail!("job '{target}' not found in {}", wf.path.display());
             }
-            let mut todo = vec![target.to_string()];
-            while let Some(j) = todo.pop() {
-                if selected.insert(j.clone()) {
-                    todo.extend(wf.jobs[&j].needs());
-                }
-            }
+            selected = with_needs(wf, target);
         }
         None => selected.extend(wf.jobs.keys().cloned()),
     }

@@ -1601,16 +1601,19 @@ fn job_status_functions_see_every_ancestor() {
 #[test]
 fn continue_on_error_is_evaluated_per_matrix_leg() {
     // GitHub's `experimental` pattern: the tolerated leg neither fails the job
-    // nor cancels its sibling through fail-fast.
+    // nor cancels its sibling through fail-fast. Leg 1 waits for leg 2 to fail
+    // before its second step, which a fail-fast would cancel.
     let repo = TempRepo::new();
     repo.workflow(
         "mx.yml",
-        "name: mx\non: push\njobs:\n  m:\n    runs-on: ubuntu-latest\n    continue-on-error: ${{ matrix.experimental == true }}\n    strategy:\n      matrix:\n        v: [1, 2]\n        include:\n          - v: 2\n            experimental: true\n    steps:\n      - run: '[ \"${{ matrix.v }}\" = 1 ] && sleep 1 && echo leg one done || exit 1'\n  after:\n    needs: m\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo after ran\n",
+        "name: mx\non: push\njobs:\n  m:\n    runs-on: ubuntu-latest\n    continue-on-error: ${{ matrix.experimental == true }}\n    strategy:\n      matrix:\n        v: [1, 2]\n        include:\n          - v: 2\n            experimental: true\n    steps:\n      - if: matrix.v == 2\n        run: touch \"$MARK\"; exit 1\n      - run: for i in $(seq 100); do [ -f \"$MARK\" ] && break; sleep 0.1; done; sleep 1\n      - run: echo leg one done\n  after:\n    needs: m\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo after ran\n",
     );
+    let mark = repo.path().join("mark");
     let out = bin()
         .arg("-C")
         .arg(repo.path())
-        .args(["--host", "--no-cache-server"])
+        .args(["--host", "--no-cache-server", "--env"])
+        .arg(format!("MARK={}", mark.display()))
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
