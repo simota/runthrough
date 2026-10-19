@@ -1,27 +1,27 @@
 class Runthrough < Formula
   desc "Run GitHub Actions workflows locally"
   homepage "https://github.com/simota/runthrough"
-  version "0.1.0"
+  version "0.2.0"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/simota/runthrough/releases/download/v0.1.0/runthrough-0.1.0-aarch64-apple-darwin.tar.gz"
-      sha256 "b2187eb296d51683b28e0583b1489a41ec699bf45eacc12342dec794ca5c7aca"
+      url "https://github.com/simota/runthrough/releases/download/v0.2.0/runthrough-0.2.0-aarch64-apple-darwin.tar.gz"
+      sha256 "37832132e5d493983d258b275097ec51af9bbf1222410db0ee5eaa41a916fe09"
     end
     on_intel do
-      url "https://github.com/simota/runthrough/releases/download/v0.1.0/runthrough-0.1.0-x86_64-apple-darwin.tar.gz"
-      sha256 "82c298140961993f16de6a5119c69b8588d776f5dc04509a1b5a3301bb870148"
+      url "https://github.com/simota/runthrough/releases/download/v0.2.0/runthrough-0.2.0-x86_64-apple-darwin.tar.gz"
+      sha256 "6c2d188ba5bfd915d422932a7f2b00cbff5395fbdfb69e6a7ffbd9e99d558bd3"
     end
   end
   on_linux do
     on_arm do
-      url "https://github.com/simota/runthrough/releases/download/v0.1.0/runthrough-0.1.0-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "d4a4b696471e966d8133766ed7bef647e693acfa036650ce916fb554f7d99220"
+      url "https://github.com/simota/runthrough/releases/download/v0.2.0/runthrough-0.2.0-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "edac993b884d742ddbfb6e605ce3669917055a76f0b21bc113811ea102817726"
     end
     on_intel do
-      url "https://github.com/simota/runthrough/releases/download/v0.1.0/runthrough-0.1.0-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "00da03884b76a55aefb22eb498543fa4252993c5d778b989a990a0a3b07baad3"
+      url "https://github.com/simota/runthrough/releases/download/v0.2.0/runthrough-0.2.0-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "8779006b2e637b3d4e0b6e115d275e55c3f6bef8e8f7053ab4ea009bf29b11d9"
     end
   end
 
