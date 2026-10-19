@@ -85,6 +85,7 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
   letter-spacing: .08em;
   text-transform: uppercase;
   padding: .5rem 1rem .45rem;
+  justify-self: start;
   transform: rotate(-1.2deg);
   clip-path: polygon(2% 0, 98% 4%, 100% 50%, 97% 100%, 1% 96%, 0 45%);
 }
@@ -117,7 +118,8 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
 .cmd {
   display: flex; align-items: stretch; border: 1px solid var(--ink); background: var(--floor-2); min-width: 0;
 }
-.cmd pre { margin: 0; padding: .85rem 1rem; overflow-x: auto; flex: 1; min-width: 0; font-size: .85rem; line-height: 1.55; }
+.cmd pre { margin: 0; padding: .85rem 1rem; flex: 1; min-width: 0; font-size: .8rem; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.cmd pre .ln { display: block; padding-left: 1.2em; text-indent: -1.2em; }
 .cmd pre .p { color: var(--muted); user-select: none; }
 .copy {
   border: 0; border-left: 1px solid var(--ink); background: var(--ink); color: var(--floor);
@@ -125,6 +127,7 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
 }
 .copy:hover { background: var(--cue); }
 .needs { font-size: var(--step--1); color: var(--muted); }
+.needs code { white-space: nowrap; }
 
 /* Terminal = the stage */
 .stage {
@@ -147,7 +150,8 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
 .cues { border-top: 2px solid var(--ink); }
 .cue { display: grid; grid-template-columns: 4.5rem minmax(0, 22rem) minmax(0, 1fr); gap: 1.25rem; padding-block: 1rem; border-bottom: 1px solid var(--line); align-items: baseline; }
 .cue .n { font: 700 1.35rem/1 var(--display); color: var(--muted); letter-spacing: .04em; }
-.cue code { font-size: .88rem; overflow-x: auto; white-space: nowrap; display: block; min-width: 0; }
+.cue > code { font-size: .88rem; overflow-x: auto; white-space: nowrap; display: block; min-width: 0; }
+.cue p code { font-size: .9em; color: var(--ink); }
 .cue p { color: var(--muted); min-width: 0; }
 
 /* Repertoire */
@@ -181,7 +185,7 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
 .graph { display: grid; grid-template-columns: repeat(3, minmax(8.5rem, 1fr)); gap: .9rem; min-width: 28rem; }
 .col { display: grid; gap: .5rem; align-content: start; }
 .col h4 { margin: 0 0 .2rem; font: 600 .68rem/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
-.job { display: flex; align-items: center; gap: .5rem; background: var(--floor); border: 1px solid var(--line); padding: .5rem .6rem; font: 400 .78rem/1.2 var(--mono); }
+.job { display: flex; align-items: center; gap: .5rem; white-space: nowrap; background: var(--floor); border: 1px solid var(--line); padding: .5rem .6rem; font: 400 .78rem/1.2 var(--mono); }
 .job .dot { width: .6rem; height: .6rem; border-radius: 50%; flex: none; }
 .job .t { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
 .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); } .dot.skip { background: transparent; border: 1.5px solid var(--muted); }
@@ -200,7 +204,7 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
 .call .section-head p { color: color-mix(in srgb, var(--floor) 70%, var(--ink)); }
 .call .tape { color: var(--tape-ink); }
 .exits { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0; border-top: 1px solid color-mix(in srgb, var(--floor) 25%, var(--ink)); }
-.exit { padding: 1.5rem 1.5rem 0 0; display: grid; gap: .5rem; }
+.exit { padding: 1.5rem 1.5rem 0 0; display: grid; gap: .5rem; align-content: start; }
 .exit + .exit { padding-left: 1.5rem; border-left: 1px solid color-mix(in srgb, var(--floor) 25%, var(--ink)); }
 .exit b { font: 900 4rem/1 var(--display); }
 .exit p { color: color-mix(in srgb, var(--floor) 72%, var(--ink)); }
@@ -215,6 +219,7 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
   .cue { grid-template-columns: 3rem minmax(0, 1fr); }
   .cue p { grid-column: 2; }
   .gaps { grid-template-columns: minmax(0, 1fr); }
+  .bar nav { gap: .5rem 1rem; }
 }
 @media (max-width: 560px) {
   .exits { grid-template-columns: minmax(0, 1fr); }
@@ -245,9 +250,7 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
       <div class="install">
         <span class="install-label">Install with Homebrew</span>
         <div class="cmd">
-          <pre id="install-cmd"><span class="p">$ </span>brew tap simota/runthrough https://github.com/simota/runthrough
-<span class="p">$ </span>brew trust --formula simota/runthrough/runthrough
-<span class="p">$ </span>brew install runthrough</pre>
+          <pre id="install-cmd"><span class="ln"><span class="p">$ </span>brew tap simota/runthrough https://github.com/simota/runthrough</span><span class="ln"><span class="p">$ </span>brew trust --formula simota/runthrough/runthrough</span><span class="ln"><span class="p">$ </span>brew install runthrough</span></pre>
           <button class="copy" id="copy-install" type="button" aria-label="Copy install commands">Copy</button>
         </div>
         <p class="needs">Prebuilt for macOS and Linux, or <code>cargo install --path .</code> from a checkout. Needs <code>git</code>. Container jobs need Docker or Apple <code>container</code>. Host jobs use the shells you already have.</p>
