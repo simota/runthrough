@@ -1577,6 +1577,11 @@ fn job_status_functions_see_every_ancestor() {
             job("d", "    needs: b\n    if: failure()\n", "echo d ran"),
             job("s", "    if: false\n", "echo s"),
             job("t", "    needs: s\n    if: failure()\n", "echo t ran"),
+            job(
+                "u",
+                "    needs: s\n    if: ${{ !failure() && !cancelled() }}\n",
+                "echo u ran",
+            ),
         ]
         .concat(),
     );
@@ -1585,6 +1590,8 @@ fn job_status_functions_see_every_ancestor() {
     assert!(out.contains("chain / d: success"), "{out}");
     assert!(out.contains("| d ran"), "{out}");
     assert!(out.contains("chain / t: skipped"), "{out}");
+    // The documented way to run after a skipped need.
+    assert!(out.contains("| u ran"), "{out}");
     assert!(
         !out.contains("| c ran") && !out.contains("| t ran"),
         "{out}"
