@@ -542,6 +542,8 @@ struct ArtifactStore {
     artifacts: Vec<Artifact>,
     /// Per-run HMAC key for the v4 upload/download URLs.
     key: Vec<u8>,
+    /// Which bearer tokens the Twirp and v3 calls must carry.
+    auth: RuntimeAuth,
 }
 
 /// Signed URLs stay valid this long, as in act.
@@ -567,6 +569,64 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
         .to_vec()
 }
 
+/// `a == b` in time that does not depend on where they first differ.
+fn same(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0, |d, (x, y)| d | (x ^ y)) == 0
+}
+
+/// The `ACTIONS_RUNTIME_TOKEN`s of this run: JWTs signed (HS256) with a
+/// per-run key, or the one taken from the caller's environment. The artifact
+/// API accepts only requests that carry one, as GitHub's does, so other local
+/// users (or the LAN, where the servers listen beyond loopback) cannot read
+/// or replace a run's artifacts.
+#[derive(Clone)]
+struct RuntimeAuth {
+    key: Vec<u8>,
+    from_env: Option<String>,
+}
+
+impl RuntimeAuth {
+    fn new(from_env: Option<String>) -> RuntimeAuth {
+        RuntimeAuth {
+            key: hex::decode(random_token()).unwrap_or_default(),
+            from_env,
+        }
+    }
+
+    /// The token jobs get: the caller's, else one this run signs over `claims`.
+    fn issue(&self, claims: &Value) -> String {
+        if let Some(t) = &self.from_env {
+            return t.clone();
+        }
+        let signed = format!(
+            "{}.{}",
+            base64url(br#"{"alg":"HS256","typ":"JWT"}"#),
+            base64url(claims.to_string().as_bytes())
+        );
+        let sig = base64url(&hmac_sha256(&self.key, signed.as_bytes()));
+        format!("{signed}.{sig}")
+    }
+
+    /// Whether `req` carries `Authorization: Bearer <a token this run issued>`.
+    fn accepts(&self, req: &Request) -> bool {
+        let Some(token) = req
+            .headers
+            .get("authorization")
+            .and_then(|h| h.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, t)| t.trim())
+        else {
+            return false;
+        };
+        if let Some(t) = &self.from_env {
+            return same(token, t);
+        }
+        token.rsplit_once('.').is_some_and(|(signed, sig)| {
+            same(sig, &base64url(&hmac_sha256(&self.key, signed.as_bytes())))
+        })
+    }
+}
+
 impl ArtifactStore {
     /// `?expires=…&sig=…` for `/{kind}/{id}`.
     fn sign(&self, kind: &str, id: u64) -> String {
@@ -587,7 +647,7 @@ impl ArtifactStore {
             &self.key,
             format!("{kind}/{id}/{expires}").as_bytes(),
         ));
-        fresh && want == *sig
+        fresh && same(&want, sig)
     }
 }
 
@@ -758,6 +818,15 @@ fn artifact_v3(dir: &Path, host: &str, req: &Request) -> Response {
 fn artifact_handler(shared: Arc<Mutex<ArtifactStore>>, req: Request) -> Response {
     let host = req.headers.get("host").cloned().unwrap_or_default();
     let mut store = shared.lock().unwrap();
+    // Block uploads and downloads go to the signed URLs `twirp` hands out,
+    // without a token; every other call carries the job's.
+    let signed = req.path.starts_with("/upload/") || req.path.starts_with("/download/");
+    if !signed && !store.auth.accepts(&req) {
+        return Response::json(
+            401,
+            json!({"code": "unauthenticated", "msg": "missing or invalid ACTIONS_RUNTIME_TOKEN"}),
+        );
+    }
     if req.path.starts_with("/_apis/pipelines/") || req.path.starts_with("/v3/") {
         // The v3 API keeps no state beyond its files.
         let dir = store.dir.clone();
@@ -1005,6 +1074,7 @@ pub struct Servers {
     cache_external: Option<String>,
     artifact_port: Option<u16>,
     run_id: String,
+    auth: RuntimeAuth,
 }
 
 fn base64url(data: &[u8]) -> String {
@@ -1034,6 +1104,12 @@ impl Servers {
             artifact_port: None,
             run_id: format!("{}-{}", std::process::id(), now()),
             cache_token: random_token(),
+            // As in act, a token from the caller's environment wins.
+            auth: RuntimeAuth::new(
+                std::env::var("ACTIONS_RUNTIME_TOKEN")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
+            ),
         };
         if !cli.no_cache_server {
             let dir = cli
@@ -1068,6 +1144,7 @@ impl Servers {
                 dir: path.canonicalize()?,
                 artifacts: vec![],
                 key: hex::decode(random_token()).unwrap_or_default(),
+                auth: servers.auth.clone(),
             }));
             let p = serve(
                 cli.artifact_server_addr.as_deref().unwrap_or(default_addr),
@@ -1091,7 +1168,6 @@ impl Servers {
         if self.cache_port.is_none() && self.artifact_port.is_none() {
             return env;
         }
-        let header = base64url(br#"{"alg":"HS256","typ":"JWT"}"#);
         // BuildKit's `type=gha` cache refuses a token without `ac`, `exp` or `nbf`.
         // `ac` (a JSON string, as GitHub sends it) grants read and write on the
         // scope the cache server reports; BuildKit writes only to a writable one.
@@ -1101,16 +1177,9 @@ impl Servers {
             "nbf": 0,
             "exp": 4_102_444_800u64,
         });
-        let token = format!(
-            "{header}.{}.runthrough",
-            base64url(claims.to_string().as_bytes())
-        );
+        env.push(("ACTIONS_RUNTIME_TOKEN".into(), self.auth.issue(&claims)));
         // As in act, values from the caller's environment win.
         let from_env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-        env.push((
-            "ACTIONS_RUNTIME_TOKEN".into(),
-            from_env("ACTIONS_RUNTIME_TOKEN").unwrap_or(token),
-        ));
         if let Some(p) = self.cache_port {
             let path = format!("{}/{}", self.cache_token, cache_mode_segment(cache_mode));
             let url = match &self.cache_external {
@@ -1263,10 +1332,13 @@ mod tests {
     #[test]
     fn artifact_blocks_join_and_download() {
         let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({"scp": "x"}));
         let store = Arc::new(Mutex::new(ArtifactStore {
             dir: dir.path().to_path_buf(),
             artifacts: vec![],
             key: b"k".to_vec(),
+            auth,
         }));
         let call = |method: &str, path: &str, query: &str, body: &[u8]| {
             artifact_handler(
@@ -1279,7 +1351,11 @@ mod tests {
                         .filter_map(|kv| kv.split_once('='))
                         .map(|(k, v)| (k.to_string(), v.to_string()))
                         .collect(),
-                    headers: HashMap::new(),
+                    // Signed URLs need no token; the toolkit sends it anyway on API calls.
+                    headers: HashMap::from([(
+                        "authorization".to_string(),
+                        format!("Bearer {token}"),
+                    )]),
                     body: body.to_vec(),
                 },
             )
@@ -1326,6 +1402,98 @@ mod tests {
         let mut wire = Vec::new();
         write_response(&mut wire, &resp).unwrap();
         assert!(wire.ends_with(b"\r\n\r\nworldhello "));
+    }
+
+    /// Without a token this run issued, the artifact API refuses every call
+    /// but the signed block URLs, whose signature is checked instead.
+    #[test]
+    fn artifact_api_calls_need_a_runtime_token_of_this_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({"scp": "Actions.Results:1:j"}));
+        let store = Arc::new(Mutex::new(ArtifactStore {
+            dir: dir.path().to_path_buf(),
+            artifacts: vec![],
+            key: b"k".to_vec(),
+            auth,
+        }));
+        let call = |method: &str, path: &str, auth: Option<&str>| {
+            artifact_handler(
+                store.clone(),
+                Request {
+                    method: method.into(),
+                    path: path.into(),
+                    query: HashMap::from([("itemPath".into(), "a/f".into())]),
+                    headers: auth
+                        .map(|a| HashMap::from([("authorization".to_string(), a.to_string())]))
+                        .unwrap_or_default(),
+                    body: json!({"workflow_run_backend_id": "r", "name": "a"})
+                        .to_string()
+                        .into_bytes(),
+                },
+            )
+            .status
+        };
+        let create = "/twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact";
+        let list = "/twirp/github.actions.results.api.v1.ArtifactService/ListArtifacts";
+        let (head, payload) = token.rsplit_once('.').unwrap().0.split_once('.').unwrap();
+        let forged = format!("{head}.{payload}.runthrough");
+        let other_run = RuntimeAuth::new(None).issue(&json!({"scp": "Actions.Results:1:j"}));
+        for bad in [
+            None,
+            Some(forged.as_str()),
+            Some(other_run.as_str()),
+            Some(token.as_str()),
+        ] {
+            let header = bad.map(|t| {
+                if t == token {
+                    format!("Basic {t}")
+                } else {
+                    format!("Bearer {t}")
+                }
+            });
+            for (method, path) in [
+                ("POST", create),
+                ("POST", list),
+                ("GET", "/_apis/pipelines/workflows/r/artifacts"),
+                ("PUT", "/v3/upload/r"),
+                ("GET", "/v3/download/r"),
+            ] {
+                assert_eq!(
+                    call(method, path, header.as_deref()),
+                    401,
+                    "{path} {header:?}"
+                );
+            }
+        }
+        assert!(!dir.path().join("v3").exists());
+        let bearer = format!("bearer {token}");
+        assert_eq!(call("POST", create, Some(&bearer)), 200);
+        assert_eq!(call("POST", list, Some(&bearer)), 200);
+        // A block URL is judged by its signature alone.
+        assert_eq!(call("PUT", "/upload/1", None), 401);
+        assert_eq!(call("GET", "/download/1", Some(&bearer)), 401);
+    }
+
+    #[test]
+    fn a_token_from_the_callers_environment_is_issued_and_accepted() {
+        let auth = RuntimeAuth::new(Some("ghs_real".into()));
+        assert_eq!(auth.issue(&json!({})), "ghs_real");
+        let req = |h: &str| Request {
+            method: "POST".into(),
+            path: "/".into(),
+            query: HashMap::new(),
+            headers: HashMap::from([("authorization".to_string(), h.to_string())]),
+            body: vec![],
+        };
+        assert!(auth.accepts(&req("Bearer ghs_real")));
+        assert!(!auth.accepts(&req("Bearer ghs_other")));
+        let signed = RuntimeAuth {
+            key: auth.key.clone(),
+            from_env: None,
+        }
+        .issue(&json!({}));
+        assert!(!auth.accepts(&req(&format!("Bearer {signed}"))));
     }
 
     #[test]
@@ -1387,6 +1555,7 @@ mod tests {
             dir: PathBuf::new(),
             artifacts: vec![],
             key: b"k".to_vec(),
+            auth: RuntimeAuth::new(None),
         };
         let q: HashMap<String, String> = store
             .sign("upload", 7)
@@ -1449,6 +1618,7 @@ mod tests {
             cache_external: None,
             artifact_port: None,
             run_id: "7".into(),
+            auth: RuntimeAuth::new(None),
         };
         let env = servers.job_env("h", "build", CacheMode::Write);
         let token = &env

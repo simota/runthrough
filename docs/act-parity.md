@@ -197,13 +197,14 @@ Sources: act `master` — `pkg/runner/step_run.go`, `pkg/runner/job_executor.go`
 `pkg/artifacts/server.go`, `pkg/artifacts/artifacts_v4.go`, `pkg/container/docker_run.go`;
 `runthrough` at `dad8e91`. Already on par: pre → main → post
 order with post steps in reverse, job result from step failures, the v3 artifact routes,
-`.gz__` storage and missing authorization (runthrough's artifact server has none either).
+`.gz__` storage and missing authorization (runthrough's artifact server had none either; it now checks the job's token, below).
 act keeping failed jobs' containers is the "not adopted" item above.
 
 - [x] PowerShell scripts get `$ErrorActionPreference = 'stop'` and end with `exit $LASTEXITCODE` (GitHub's wrapper) — reproduced before the fix: a failing native command left the step green
 - [x] `cmd` shell (`cmd /D /E:ON /V:OFF /S /C "CALL "{0}""`, script prefixed with `@echo off`) and PowerShell as the default shell for host jobs on Windows (`pwsh`, else `powershell`); not exercised, as no Windows host was available
 - [x] v4 upload/download URLs are signed (HMAC-SHA256 with a per-run key) and expire after 60 minutes; a bad or stale signature gets 401 — previously `sig=runthrough` was never checked
 - [x] Images that run as a non-root user can write outputs and the workspace: copy mode creates and copies as root, then opens the files (`chmod a+rwX`); with bind mounts the job's own scratch directories are opened on the host (act chowns instead; the user's repository under `--bind` is never touched) — reproduced before the fix in copy mode
+- [x] The artifact API (Twirp calls and the v3 routes) needs `Authorization: Bearer` with a token this run issued: `ACTIONS_RUNTIME_TOKEN` is an HS256 JWT signed with a per-run key, or the caller's own `ACTIONS_RUNTIME_TOKEN`; other calls get 401. act's server checks nothing, so with `0.0.0.0` (Apple `container`) anyone on the network could read or replace artifacts — round-tripped with the real v3 and v4 actions
 - [x] Exit code 127 is explained as "command not found"
 - [x] The job container gets its job ID as a network alias on user-defined networks, so services can reach it
 - [x] Not adopted: act allocates a TTY for `exec` when the terminal is one; runthrough parses step output line by line, and a TTY would merge stderr and add carriage returns
