@@ -10,6 +10,7 @@ jobs:
         with:
           value: ab
       - run: test "${{ steps.js.outputs.doubled }}" = abab
+      - run: echo "pr base_ref=${{ github.base_ref }} head_ref=${{ github.head_ref != '' }}"
       - run: exit 3
       - if: failure()
         run: echo "cleanup after failure"

@@ -170,9 +170,11 @@ fn runthrough_dir_workflows_are_discovered() {
 
 #[test]
 fn failing_workflow_runs_failure_steps_and_skips_dependents() {
-    let (code, out) = runthrough(&["pull_request"]);
+    let (code, out) = runthrough(&["pull_request", "--defaultbranch", "trunk"]);
     assert_eq!(code, 1, "{out}");
     assert!(out.contains("node got ab"), "{out}");
+    // Without `-e`, the payload is a PR from HEAD into the default branch.
+    assert!(out.contains("pr base_ref=trunk head_ref=true"), "{out}");
     assert!(out.contains("cleanup after failure"), "{out}");
     assert!(out.contains("post sees state ab"), "{out}");
     assert!(out.contains("failing / never: skipped"), "{out}");

@@ -562,8 +562,14 @@ fn run(cli: &Cli) -> Result<bool> {
         .defaultbranch
         .clone()
         .unwrap_or_else(|| repo.default_branch.clone());
-    if cli.eventpath.is_none() && event_name == "merge_group" {
-        event = repo.merge_group_event(&cli.remote_name, &branch);
+    if cli.eventpath.is_none() {
+        match event_name.as_str() {
+            "merge_group" => event = repo.merge_group_event(&cli.remote_name, &branch),
+            "pull_request" | "pull_request_target" => {
+                event = repo.pull_request_event(&cli.remote_name, &branch)
+            }
+            _ => {}
+        }
     }
     repo.fill_event_repository(&mut event, &branch);
 

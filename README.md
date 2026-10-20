@@ -43,7 +43,7 @@ Flags follow act's names (`--matrix`, `--reuse`, `--json`, `--input-file`, …);
 | Event payload | `-e event.json` | — |
 | Default arguments | — | `$XDG_CONFIG_HOME/act/actrc`, `~/.actrc`, `./.actrc` |
 
-Flags win over files. Arguments from `.actrc` files are read before the command line's. Without `-e`, a `merge_group` run gets a payload built from the repository (`head_sha`/`head_ref` from HEAD, `base_sha` where HEAD forked from the remote's default branch).
+Flags win over files. Arguments from `.actrc` files are read before the command line's. Without `-e`, a `merge_group` run gets a payload built from the repository (`head_sha`/`head_ref` from HEAD, `base_sha` where HEAD forked from the remote's default branch). A `pull_request` or `pull_request_target` run gets a PR from the current branch into the default branch (`github.base_ref`/`head_ref`; `--defaultbranch` picks another base).
 
 ### Dashboard
 
