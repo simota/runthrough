@@ -174,6 +174,33 @@ impl RepoInfo {
         })
     }
 
+    /// A pull_request payload for HEAD when no event file is given: a PR from
+    /// the current branch (`head`) into the default branch (`base`), so
+    /// `github.base_ref`/`head_ref` are set. `base.sha` is `<remote>/<default>`
+    /// unless it is HEAD itself, where `on.pull_request.paths` would see no
+    /// changes. No `action`, so every `types` filter passes.
+    pub fn pull_request_event(&self, remote: &str, default_branch: &str) -> Value {
+        let mut event = json!({
+            "pull_request": {
+                "head": {"ref": self.ref_name, "sha": self.sha},
+                "base": {"ref": default_branch},
+            },
+        });
+        let base_sha = git(
+            &self.root,
+            &[
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("refs/remotes/{remote}/{default_branch}^{{commit}}"),
+            ],
+        );
+        if let Some(sha) = base_sha.filter(|s| *s != self.sha) {
+            event["pull_request"]["base"]["sha"] = json!(sha);
+        }
+        event
+    }
+
     /// `<remote>/<branch>` when HEAD is ahead of it, as GitHub's `before` for a
     /// push of HEAD; `None` for a new, behind or up-to-date branch.
     fn push_before(&self, remote: &str) -> Option<String> {
