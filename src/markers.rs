@@ -4,6 +4,7 @@
 const JOB_START: &str = "🚀 start job on ";
 const JOB_SKIPPED: &str = "⏭️  job skipped";
 const STEP_START: &str = "⭐ ";
+const NOTE: &str = "ℹ️  ";
 const STEP_SKIPPED: &str = "⏭️  ";
 /// Prefixes of a step's end line, by its status.
 const STEP_ENDS: [(&str, &str); 4] = [
@@ -55,6 +56,15 @@ pub fn parse_step_start(msg: &str) -> Option<&str> {
     msg.strip_prefix(STEP_START)
 }
 
+/// `ℹ️  <text>`: something this job uses that a local run does not reproduce.
+pub fn note(text: &str) -> String {
+    format!("{NOTE}{text}")
+}
+
+pub fn parse_note(msg: &str) -> Option<&str> {
+    msg.strip_prefix(NOTE)
+}
+
 /// `⏭️  <name>`: a step was skipped.
 pub fn step_skipped(name: &str) -> String {
     format!("{STEP_SKIPPED}{name}")
@@ -89,6 +99,59 @@ pub fn parse_step_end(msg: &str) -> Option<(&str, &'static str, Option<f64>)> {
         _ => name,
     };
     Some((name, status, secs))
+}
+
+/// The line that closes a run: workflows and jobs by result, the wall time and,
+/// when the run was recorded, where the dashboard shows it. `🏁` when the run
+/// succeeds (`ok`, as its exit code says), else `❌`. Not a job line: `history`
+/// never sees it.
+pub fn curtain(
+    ok: bool,
+    workflows: usize,
+    results: &[&str],
+    secs: f64,
+    url: Option<&str>,
+) -> String {
+    let plural = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+    let counts: Vec<String> = [
+        ("success", "succeeded"),
+        ("failure", "failed"),
+        ("cancelled", "cancelled"),
+        ("skipped", "skipped"),
+    ]
+    .iter()
+    .filter_map(|(result, label)| {
+        let n = results.iter().filter(|r| *r == result).count();
+        (n > 0).then(|| format!("{n} {label}"))
+    })
+    .collect();
+    let mut line = format!(
+        "{} {}, {}",
+        if ok { "🏁" } else { "❌" },
+        plural(workflows, "workflow"),
+        plural(results.len(), "job")
+    );
+    if !counts.is_empty() {
+        line.push_str(&format!(": {}", counts.join(", ")));
+    }
+    line.push_str(&format!(" in {secs:.1}s"));
+    if let Some(url) = url {
+        line.push_str(&format!(" · {url}"));
+    }
+    line
+}
+
+/// What changed since the previous `--watch` run: each job (`wf / job`) whose
+/// result changed, or that nothing did and how long the two runs took.
+pub fn since_last(changed: &[(String, &str, &str)], secs: f64, last_secs: f64) -> String {
+    if changed.is_empty() {
+        return format!("🔁 no change since the last run ({secs:.1}s, was {last_secs:.1}s)");
+    }
+    let changes: Vec<String> = changed
+        .iter()
+        .map(|(job, before, after)| format!("{job}: {before} → {after}"))
+        .collect();
+    format!("🔁 since the last run: {}", changes.join("; "))
 }
 
 /// `name (1.2s)` → (`name`, 1.2); `name` → (`name`, None).
@@ -140,5 +203,54 @@ mod tests {
         assert_eq!(parse_job_skipped(&job_skipped(": why")), Some(": why"));
         assert_eq!(parse_step_start(&step_start("Run a")), Some("Run a"));
         assert_eq!(parse_step_skipped(&step_skipped("Run a")), Some("Run a"));
+        assert_eq!(parse_note(&note("x is not y")), Some("x is not y"));
+    }
+
+    #[test]
+    fn curtain_counts_jobs_by_result() {
+        assert_eq!(
+            curtain(true, 1, &["success"], 2.04, None),
+            "🏁 1 workflow, 1 job: 1 succeeded in 2.0s"
+        );
+        assert_eq!(
+            curtain(
+                false,
+                2,
+                &["success", "failure", "skipped", "success"],
+                12.25,
+                Some("http://127.0.0.1:7766/#/run/1-2")
+            ),
+            "❌ 2 workflows, 4 jobs: 2 succeeded, 1 failed, 1 skipped in 12.2s · http://127.0.0.1:7766/#/run/1-2"
+        );
+        // A workflow that failed to load fails the run, whatever its jobs did.
+        assert!(curtain(false, 1, &["success"], 1.0, None).starts_with("❌ "));
+        assert_eq!(
+            curtain(true, 0, &[], 0.0, None),
+            "🏁 0 workflows, 0 jobs in 0.0s"
+        );
+        // Never mistaken for a job's end line by the dashboard.
+        assert_eq!(
+            parse_job_end(&curtain(true, 1, &["success"], 1.0, None)),
+            None
+        );
+    }
+
+    #[test]
+    fn since_last_names_changed_jobs() {
+        assert_eq!(
+            since_last(&[], 3.0, 4.25),
+            "🔁 no change since the last run (3.0s, was 4.2s)"
+        );
+        assert_eq!(
+            since_last(
+                &[
+                    ("ci / test".into(), "failure", "success"),
+                    ("ci / lint".into(), "success", "failure")
+                ],
+                1.0,
+                1.0
+            ),
+            "🔁 since the last run: ci / test: failure → success; ci / lint: success → failure"
+        );
     }
 }

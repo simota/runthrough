@@ -3,7 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RunThrough</title>
+<title>runthrough</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%23101214'/><circle cx='16' cy='11' r='4.5' fill='%23ffd678'/><path d='M2.5 20.5 29.5 18l.5 6.5-27 2.5z' fill='%23f3c21c'/></svg>">
 <style>
 :root {
   --ground: #F4F5F8; --surface: #FFFFFF; --line: #E1E4EA; --line-strong: #CDD2DB;
@@ -113,6 +114,13 @@ input[type=search] { min-height: 36px; padding: 0 10px; border: 1px solid var(--
 .kv code { overflow-wrap: anywhere; }
 .cell { display: grid; min-width: 0; }
 .empty { padding: 32px 16px; text-align: center; color: var(--muted); }
+.md { padding: 4px 16px 12px; overflow-wrap: anywhere; }
+.md h3, .md h4, .md h5, .md h6 { margin: 16px 0 8px; font-size: 15px; line-height: 22px; }
+.md p, .md ul, .md ol, .md pre, .md .md-table { margin: 8px 0; }
+.md pre { background: var(--ground); padding: 10px 12px; border-radius: 6px; overflow-x: auto; }
+.md-table { overflow-x: auto; }
+.md table { border-collapse: collapse; }
+.md th, .md td { border: 1px solid var(--line); padding: 6px 10px; text-align: left; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 /* Where the sidebar and the main column no longer fit side by side (220 + 16 +
    560 + the page's padding and scrollbar), the job list follows the page's
@@ -128,7 +136,7 @@ input[type=search] { min-height: 36px; padding: 0 10px; border: 1px solid var(--
 </head>
 <body>
 <header>
-  <a class="brand" href="#/"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M10 8.5v7l5.5-3.5z"/></svg>RunThrough</a>
+  <a class="brand" href="#/"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M10 8.5v7l5.5-3.5z"/></svg>runthrough</a>
   <nav id="crumbs" aria-label="Breadcrumb"></nav>
   <div class="tools"><span class="live" id="live" hidden><span class="dot"></span><span>live</span></span><a id="nav-resources" href="#/resources">Resources</a></div>
 </header>
@@ -145,6 +153,7 @@ const ICONS = {
   skipped: ['var(--neutral)', '<circle cx="12" cy="12" r="9"/><path d="m6 18 12-12"/>', 'Skipped'],
   cancelled: ['var(--neutral)', '<circle cx="12" cy="12" r="9"/><path d="m6 18 12-12"/>', 'Cancelled'],
   interrupted: ['var(--neutral)', '<circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/>', 'Interrupted'],
+  info: ['var(--accent)', '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>', 'Not reproduced locally'],
 };
 const LABEL = { success: 'Success', failure: 'Failure', warning: 'Continued on error', running: 'In progress', queued: 'Queued', skipped: 'Skipped', cancelled: 'Cancelled', interrupted: 'Interrupted' };
 const COLOR = { success: 'var(--success)', failure: 'var(--failure)', running: 'var(--running)', warning: 'var(--running)' };
@@ -201,7 +210,7 @@ function crumbs(...parts) {
   const nav = document.getElementById('crumbs');
   parts[parts.length - 1].setAttribute('aria-current', 'page');
   nav.replaceChildren(...parts.flatMap((p, i) => [i ? h('span', { 'aria-hidden': 'true' }, '/') : null, p]).filter(Boolean));
-  document.title = [...parts.slice(1).reverse().map(p => p.textContent), parts.length > 1 ? null : parts[0].textContent, 'RunThrough'].filter(Boolean).join(' · ');
+  document.title = [...parts.slice(1).reverse().map(p => p.textContent), parts.length > 1 ? null : parts[0].textContent, 'runthrough'].filter(Boolean).join(' · ');
 }
 /** Say `text` to assistive technology; the page itself is not a live region, since every poll redraws it. */
 function announce(text) {
@@ -377,6 +386,21 @@ function viewRun(run, config) {
     if (j.status === 'failure') notes.push(['failure', j, j.error || 'Job failed']);
     for (const s of j.steps) if (s.status === 'warning') notes.push(['warning', j, `Step “${s.name}” failed and continued (continue-on-error).`]);
   }
+  // What the run did not reproduce locally, once per note however many jobs said it.
+  const understudies = new Map();
+  for (const j of run.jobs) for (const t of j.notes || []) {
+    const u = understudies.get(t) || { j, n: 0 };
+    u.n++;
+    understudies.set(t, u);
+  }
+  for (const [t, u] of understudies) notes.push(['info', u.j, u.n > 1 ? `${t} (and ${u.n - 1} more job${u.n > 2 ? 's' : ''})` : t]);
+  // Step summaries, one card per job as on GitHub's run page.
+  const summaries = new Map();
+  for (const s of run.summaries || []) {
+    const k = s.workflow + '\n' + s.job;
+    const prev = summaries.get(k);
+    summaries.set(k, prev ? { ...prev, markdown: prev.markdown + '\n\n' + s.markdown } : s);
+  }
   const cmd = shellQuote(m.argv);
   return [
     h('div', { class: 'title' }, h('div', { class: 'who' }, icon(run.status, 28),
@@ -389,11 +413,71 @@ function viewRun(run, config) {
       h('div', {}, h('small', {}, 'Repository'), h('b', { class: 'ellipsis', title: m.repository || m.root }, m.repository || m.root)),
       h('div', {}, h('small', {}, 'Commit'), h('b', { class: 'mono' }, shortSha(m.sha) || '—'))),
     h('div', { class: 'cmd' }, h('code', {}, '$ ' + cmd),
-      copyButton('Copy command', () => cmd)),
+      copyButton('Copy command', () => cmd),
+      run.finished ? copyButton('Copy rehearsal note', () => rehearsalNote(run), { title: 'Copy what ran locally and how it went as Markdown, for a pull request' }) : null),
     h('div', { class: 'cols' }, side, h('div', { class: 'main' }, config ? configCard(m.config) : [...graphs,
       notes.length ? h('section', { class: 'card', 'aria-label': 'Annotations' }, h('h2', {}, 'Annotations'),
-        notes.map(([k, j, text]) => h('div', { class: 'note' }, icon(k, 18), h('div', {}, h('a', { href: legHref(m.id, j.workflow, j.job), style: 'font-weight:600' }, j.job), h('div', { class: 'sub' }, text))))) : null])),
+        notes.map(([k, j, text]) => h('div', { class: 'note' }, icon(k, 18), h('div', {}, h('a', { href: legHref(m.id, j.workflow, j.job), style: 'font-weight:600' }, j.job), h('div', { class: 'sub' }, text))))) : null,
+      ...[...summaries.values()].map(s => h('section', { class: 'card', 'aria-label': 'Summary of ' + s.job },
+        h('h2', {}, h('a', { href: legHref(m.id, s.workflow, s.job) }, s.job), ' ', h('span', { class: 'sub', style: 'font-weight:400' }, 'summary')),
+        h('div', { class: 'md' }, markdown(s.markdown))))])),
   ];
+}
+
+/** A safe subset of Markdown (headings, lists, tables, code, emphasis, http links) as nodes: text never goes through innerHTML. */
+function markdown(md) {
+  const lines = md.replace(/\r\n?/g, '\n').split('\n');
+  const isSep = l => /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/.test(l);
+  const cells = l => l.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+  const block = /^(#{1,6}\s|\s*(`{3,}|~{3,})|\s*([-*+]|\d+[.)])\s)/;
+  const item = /^\s*(?:[-*+]|\d+[.)])\s+(.*)$/;
+  const out = [];
+  let m;
+  for (let i = 0; i < lines.length;) {
+    const l = lines[i];
+    if (!l.trim()) { i++; continue; }
+    if ((m = /^\s*(`{3,}|~{3,})/.exec(l))) {
+      const code = [];
+      for (i++; i < lines.length && !lines[i].trim().startsWith(m[1]); i++) code.push(lines[i]);
+      i++;
+      out.push(h('pre', {}, h('code', {}, code.join('\n'))));
+    } else if ((m = /^(#{1,6})\s+(.*)$/.exec(l))) {
+      // The card's title is the h2: the summary's own headings go below it.
+      out.push(h('h' + Math.min(6, m[1].length + 2), {}, inline(m[2])));
+      i++;
+    } else if (l.includes('|') && isSep(lines[i + 1] || '')) {
+      const head = cells(l), rows = [];
+      for (i += 2; i < lines.length && lines[i].includes('|'); i++) rows.push(cells(lines[i]));
+      out.push(h('div', { class: 'md-table' }, h('table', {},
+        h('thead', {}, h('tr', {}, head.map(c => h('th', {}, inline(c))))),
+        h('tbody', {}, rows.map(r => h('tr', {}, r.map(c => h('td', {}, inline(c)))))))));
+    } else if (item.test(l)) {
+      const ordered = /^\s*\d/.test(l), items = [];
+      for (; i < lines.length && (m = item.exec(lines[i])); i++) items.push(h('li', {}, inline(m[1])));
+      out.push(h(ordered ? 'ol' : 'ul', {}, items));
+    } else {
+      const para = [l.trim()];
+      for (i++; i < lines.length && lines[i].trim() && !block.test(lines[i]); i++) para.push(lines[i].trim());
+      out.push(h('p', {}, inline(para.join(' '))));
+    }
+  }
+  return out;
+}
+/** Inline Markdown: `code`, **strong**, *em* and [links](http…); anything else stays text. */
+function inline(text) {
+  const re = /(`+)(.+?)\1|\*\*(.+?)\*\*|\*([^*\s][^*]*)\*|\[([^\]]+)\]\(([^)\s]+)\)/g;
+  const out = [];
+  let last = 0, m;
+  while ((m = re.exec(text))) {
+    out.push(text.slice(last, m.index));
+    if (m[1]) out.push(h('code', {}, m[2]));
+    else if (m[3]) out.push(h('strong', {}, inline(m[3])));
+    else if (m[4]) out.push(h('em', {}, inline(m[4])));
+    else out.push(/^https?:\/\//i.test(m[6]) ? h('a', { href: m[6], rel: 'noopener noreferrer', target: '_blank' }, inline(m[5])) : m[0]);
+    last = re.lastIndex;
+  }
+  out.push(text.slice(last));
+  return out;
 }
 
 // What the run was given (-e/.env, --var, --input, -s, -P), as recorded with
@@ -461,7 +545,7 @@ function llmReport(run, job) {
   const plain = l => l.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
   const fence = lines => { const t = lines.join('\n'); const f = '`'.repeat(Math.max(3, ...(t.match(/`+/g) || []).map(s => s.length + 1))); return `${f}text\n${t}\n${f}`; };
   const out = [
-    'A GitHub Actions job failed when run locally with RunThrough (an act-style runner). Find the cause and suggest a fix.',
+    'A GitHub Actions job failed when run locally with runthrough (an act-style runner). Find the cause and suggest a fix.',
     '',
     '## Job',
     `- Workflow: ${job.workflow}${file ? ` (${file})` : ''}`,
@@ -481,6 +565,21 @@ function llmReport(run, job) {
     out.push('', `## Log of “${s.name}”${cut ? ` (last ${LLM_TAIL} of ${lines.length} lines)` : ''}`, fence(cut ? lines.slice(-LLM_TAIL) : lines));
   }
   return out.join('\n') + '\n';
+}
+/** A finished run as Markdown for a pull request: what ran locally, on what, and how it went. */
+function rehearsalNote(run) {
+  const m = run.meta;
+  const what = m.committed ? `commit ${shortSha(m.sha)}` : `the working tree at ${shortSha(m.sha) || 'no commit'} (uncommitted changes included)`;
+  const understudies = [...new Set(run.jobs.flatMap(j => j.notes || []))];
+  const cell = t => String(t).replace(/\|/g, '\\|');
+  return [
+    `Ran locally with runthrough${m.version ? ' ' + m.version : ''}: \`${m.event}\` on ${what}, ${m.engine}, ${dur(elapsed(run))}.`,
+    '',
+    '| Job | Result | Duration |',
+    '|---|---|---|',
+    ...run.jobs.map(j => `| ${cell(j.workflow + ' / ' + j.job)} | ${LABEL[j.status] || j.status} | ${dur(j.secs)} |`),
+    ...(understudies.length ? ['', 'Not reproduced locally:', ...understudies.map(t => `- ${t}`)] : []),
+  ].join('\n') + '\n';
 }
 /** Copy to the clipboard, also where the page is not a secure context (no `navigator.clipboard`). */
 async function copyText(text) {
@@ -599,8 +698,8 @@ function viewResources(res, runs) {
   const mono = t => h('span', { class: 'mono ellipsis', title: t }, t);
   return [
     h('div', { class: 'title' }, h('div', {}, h('h1', {}, 'Resources'),
-      h('div', { class: 'sub' }, 'Ports, containers, networks and volumes RunThrough is using on this machine.'))),
-    res.error ? h('div', { class: 'banner', role: 'alert' }, icon('failure', 18), h('div', {}, h('b', {}, 'Docker could not be listed. '), 'RunThrough lists Docker resources only, so Apple container resources do not show here. ', h('span', { class: 'mono' }, res.error))) : null,
+      h('div', { class: 'sub' }, 'Ports, containers, networks and volumes runthrough is using on this machine.'))),
+    res.error ? h('div', { class: 'banner', role: 'alert' }, icon('failure', 18), h('div', {}, h('b', {}, 'Docker could not be listed. '), 'runthrough lists Docker resources only, so Apple container resources do not show here. ', h('span', { class: 'mono' }, res.error))) : null,
     stale ? h('div', { class: 'cmd' }, h('code', {}, '$ ' + stale),
       copyButton('Copy cleanup command', () => stale)) : null,
     table('Ports', 'minmax(0,1fr) minmax(0,4fr) minmax(0,2fr)', ['Port', 'Used by', 'Run'],
@@ -608,9 +707,9 @@ function viewResources(res, runs) {
     table('Containers', 'minmax(0,3fr) minmax(0,2fr) minmax(0,2fr) minmax(0,2fr)', ['Name', 'Image', 'State', 'Run'],
       res.containers && containers.map(c => [mono(c.name), mono(c.image),
         h('span', { style: `color:${c.state === 'running' ? 'var(--success)' : 'var(--muted)'}` }, c.status || c.state), runCell(c)]),
-      'No RunThrough containers.'),
-    table('Networks', 'minmax(0,5fr) minmax(0,2fr)', ['Name', 'Run'], res.networks && networks.map(n => [mono(n.name), runCell(n)]), 'No RunThrough networks.'),
-    table('Volumes', 'minmax(0,5fr) minmax(0,2fr)', ['Name', 'Run'], res.volumes && volumes.map(v => [mono(v.name), runCell(v)]), 'No RunThrough volumes.'),
+      'No runthrough containers.'),
+    table('Networks', 'minmax(0,5fr) minmax(0,2fr)', ['Name', 'Run'], res.networks && networks.map(n => [mono(n.name), runCell(n)]), 'No runthrough networks.'),
+    table('Volumes', 'minmax(0,5fr) minmax(0,2fr)', ['Name', 'Run'], res.volumes && volumes.map(v => [mono(v.name), runCell(v)]), 'No runthrough volumes.'),
   ];
 }
 

@@ -44,6 +44,8 @@ pub struct Config {
     pub copy_mode: bool,
     pub bind: bool,
     pub use_gitignore: bool,
+    /// Check out the HEAD commit instead of copying the working tree.
+    pub committed: bool,
     /// Emulate actions/checkout by copying the local repository.
     pub skip_checkout: bool,
     pub pull: bool,
@@ -530,8 +532,11 @@ impl JobOutcome {
     }
 }
 
-/// Run every planned job; returns `true` when nothing failed.
-pub fn run_workflow(wf: &Workflow, cfg: &Config, only: Option<&str>) -> Result<bool> {
+/// Each job's result by job ID, in the order the jobs finished their stage.
+pub type JobResults = Vec<(String, JobResult)>;
+
+/// Run every planned job; returns `true` when nothing failed, and each job's result.
+pub fn run_workflow(wf: &Workflow, cfg: &Config, only: Option<&str>) -> Result<(bool, JobResults)> {
     if cfg.event_name == "workflow_dispatch" {
         let ctx = base_ctx(wf, cfg, &json!({}), &Map::new());
         check_dispatch_inputs(wf, &ctx.contexts["inputs"])
@@ -559,10 +564,11 @@ pub fn run_workflow(wf: &Workflow, cfg: &Config, only: Option<&str>) -> Result<b
     let log = Logger::new(&wf.display_name(), "concurrency", cfg);
     let Some(done) = with_concurrency(cfg, spec, &log, |cfg| run_jobs(wf, cfg, only, &Map::new()))
     else {
-        return Ok(false);
+        return Ok((false, Vec::new()));
     };
     let done = done?;
     let mut ok = true;
+    let mut results = Vec::new();
     for (id, out) in &done {
         let icon = match out.result {
             JobResult::Success => "✅",
@@ -584,8 +590,26 @@ pub fn run_workflow(wf: &Workflow, cfg: &Config, only: Option<&str>) -> Result<b
                 out.result
             ));
         }
+        results.push((id.clone(), out.result));
     }
-    Ok(ok)
+    Ok((ok, results))
+}
+
+/// What this job uses that a local run does not reproduce, as README's
+/// "Not supported" lists it: said once at the job's start, so a passing job is
+/// not taken for one GitHub would pass.
+fn understudy_notes(wf: &Workflow, job: &Job) -> Vec<&'static str> {
+    let mut notes = Vec::new();
+    if !wf.permissions.is_null() || !job.permissions.is_null() {
+        notes.push("permissions are not enforced locally");
+    }
+    if !job.environment.is_null() {
+        notes.push("environment secrets and protection rules are not applied locally");
+    }
+    if !wf.concurrency.is_null() || !job.concurrency.is_null() {
+        notes.push("concurrency groups span this runthrough invocation only");
+    }
+    notes
 }
 
 /// Print a log line. A closed stdout (`| head`) must not abort the run before
@@ -1021,6 +1045,11 @@ fn run_job(
     };
     let started = Instant::now();
     log.line(&markers::job_start(&run.backend.describe()));
+    if !cfg.quiet {
+        for note in understudy_notes(wf, job) {
+            log.line(&markers::note(note));
+        }
+    }
     let outcome = run.execute(job);
     run.cleanup();
     let outcome = outcome.unwrap_or_else(|e| {
@@ -1630,6 +1659,14 @@ impl Logger {
             } else {
                 emit(&format!("{} {l}", self.prefix));
             }
+        }
+    }
+
+    /// A step's `GITHUB_STEP_SUMMARY` (masked), for the dashboard's run summary.
+    fn summary(&self, markdown: &str) {
+        if let Some(h) = &self.history {
+            let markdown = commands::mask(markdown, &self.masks.lock().unwrap());
+            h.record(json!({"wf": self.workflow, "job": self.job, "summary": markdown}));
         }
     }
 
@@ -3828,6 +3865,7 @@ impl<'a> JobRun<'a> {
             &self.cfg.repo.root,
             &dest,
             self.cfg.use_gitignore,
+            self.cfg.committed,
             &self.cfg.objects,
         )?;
         // As in GitHub's checkout of a pushed branch, `origin/<branch>` is the
@@ -3851,11 +3889,32 @@ impl<'a> JobRun<'a> {
                 .status();
         }
         open_to_all(&dest);
-        self.log.line(&format!(
-            "  copied {} → {}",
-            self.cfg.repo.root.display(),
-            dest.display()
-        ));
+        let root = self.cfg.repo.root.display();
+        if self.cfg.committed {
+            // The commit checked out, which an event payload's `after` may not be.
+            let head = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dest)
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            self.log.line(&format!(
+                "  checked out commit {head} of {root} → {}",
+                dest.display()
+            ));
+        } else {
+            // Say what a working-tree rehearsal includes that a push would not.
+            let changes = match actions::uncommitted_changes(&self.cfg.repo.root) {
+                0 => String::new(),
+                1 => " (working tree, 1 uncommitted change; --committed leaves it out)".into(),
+                n => {
+                    format!(" (working tree, {n} uncommitted changes; --committed leaves them out)")
+                }
+            };
+            self.log
+                .line(&format!("  copied {root} → {}{changes}", dest.display()));
+        }
         self.sync_in(&dest, false)
     }
 
@@ -4079,6 +4138,7 @@ impl<'a> JobRun<'a> {
         }
         let summary = std::fs::read_to_string(file("summary"))?;
         if !summary.trim().is_empty() {
+            self.log.summary(&summary);
             self.log.line("  📝 step summary:");
             for l in summary.lines() {
                 self.log.line(&format!("  │ {l}"));
@@ -4218,6 +4278,30 @@ fn shell_argv(shell: Option<&str>, script: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn understudy_notes_name_what_runs_differently() {
+        let wf: Workflow = serde_yaml::from_str(
+            "on: push\npermissions: read-all\njobs:\n  a:\n    runs-on: x\n    environment: prod\n    concurrency: g\n    steps: [{run: a}]\n  b:\n    runs-on: x\n    steps: [{run: b}]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            understudy_notes(&wf, &wf.jobs["a"]),
+            [
+                "permissions are not enforced locally",
+                "environment secrets and protection rules are not applied locally",
+                "concurrency groups span this runthrough invocation only",
+            ]
+        );
+        assert_eq!(
+            understudy_notes(&wf, &wf.jobs["b"]),
+            ["permissions are not enforced locally"]
+        );
+        let plain: Workflow =
+            serde_yaml::from_str("on: push\njobs:\n  b:\n    runs-on: x\n    steps: [{run: b}]\n")
+                .unwrap();
+        assert!(understudy_notes(&plain, &plain.jobs["b"]).is_empty());
+    }
 
     #[test]
     fn fixed_host_ports_come_from_mappings_only() {

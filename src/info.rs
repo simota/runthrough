@@ -1,5 +1,5 @@
-//! Informational output: man page, option list, bug report, job graph, and the
-//! repository fingerprint `--watch` polls.
+//! Informational output: man page, option list, bug report, job graph, the
+//! repository fingerprint `--watch` polls, and the pre-push hook `--install-hook` writes.
 
 use crate::backend::Engine;
 use crate::workflow::Workflow;
@@ -134,6 +134,62 @@ pub fn bug_report(engine: &Engine, cache: &Path) -> String {
     out
 }
 
+/// The pre-push hook: rehearse the commit being pushed, and block the push
+/// when a job fails or runthrough cannot run, saying how to push anyway.
+const PRE_PUSH: &str = r#"#!/bin/sh
+# Installed by `runthrough --install-hook`: every `git push` first runs the
+# workflows its `push` triggers, on the HEAD commit. Add flags (e.g. --host)
+# to the runthrough line below; skip the hook once with `git push --no-verify`.
+head=$(git rev-parse HEAD 2>/dev/null)
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [ "$local_sha" != "$head" ] && [ "$local_sha" != 0000000000000000000000000000000000000000 ]; then
+    echo "runthrough: rehearsing HEAD ($head); $local_ref is not checked out and is not rehearsed" >&2
+  fi
+done
+runthrough --committed --quiet push
+status=$?
+if [ "$status" -eq 1 ]; then
+  echo "runthrough: a job failed, so the push was stopped (push anyway: git push --no-verify)" >&2
+elif [ "$status" -ne 0 ]; then
+  echo "runthrough could not run the workflows (exit $status), so the push was stopped (push anyway: git push --no-verify)" >&2
+fi
+exit "$status"
+"#;
+
+/// Write the pre-push hook into the hooks directory git uses for `root`
+/// (`core.hooksPath` included); an existing hook is never replaced.
+pub fn install_hook(root: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--git-path", "hooks/pre-push"])
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "{} is not a git repository: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let hook = root.join(String::from_utf8_lossy(&out.stdout).trim());
+    if hook.exists() {
+        anyhow::bail!(
+            "{} already exists; add `runthrough --committed --quiet push` to it, or remove it and run --install-hook again",
+            hook.display()
+        );
+    }
+    if let Some(dir) = hook.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&hook, PRE_PUSH)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(hook)
+}
+
 /// Box-and-arrow drawing of a workflow's stages.
 pub fn graph(wf: &Workflow, stages: &[Vec<String>]) -> String {
     let mut out = format!("{} ({})\n", wf.display_name(), wf.path.display());
@@ -186,4 +242,38 @@ pub fn fingerprint(root: &Path) -> u64 {
         }
     }
     h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_hook_writes_once() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(install_hook(repo.path()).is_err(), "not a repository");
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success());
+        let hook = install_hook(repo.path()).unwrap();
+        assert_eq!(hook, repo.path().join(".git/hooks/pre-push"));
+        let script = std::fs::read_to_string(&hook).unwrap();
+        assert!(script.contains("runthrough --committed --quiet push"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&hook).unwrap().permissions().mode() & 0o111,
+                0o111
+            );
+        }
+        std::fs::write(&hook, "mine").unwrap();
+        let err = install_hook(repo.path()).unwrap_err().to_string();
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(std::fs::read_to_string(&hook).unwrap(), "mine");
+    }
 }

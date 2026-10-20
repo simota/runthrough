@@ -5,6 +5,15 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="description" content="runthrough runs your GitHub Actions workflows locally: an act-style runner written in Rust.">
 <title>runthrough</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<meta property="og:type" content="website">
+<meta property="og:title" content="runthrough: the full rehearsal before you push">
+<meta property="og:description" content="Run your GitHub Actions workflows locally, in Docker, Apple container or on the host. An act-style runner in one Rust binary.">
+<meta property="og:image" content="https://simota.github.io/runthrough/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="RUNTHROUGH on a strip of yellow spike tape over a dark stage: the full rehearsal before you push.">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Stencil+Display:wght@700;900&family=Instrument+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;600&display=swap">
 <style>
@@ -295,6 +304,7 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
       <div class="cue"><span class="n">Q6</span><code>runthrough --graph</code><p>Draw the job graph.</p></div>
       <div class="cue"><span class="n">Q7</span><code>runthrough --validate --strict</code><p>Check the workflows, including unknown keys, then exit.</p></div>
       <div class="cue"><span class="n">Q8</span><code>runthrough --dashboard</code><p>Browse recorded runs at <code>127.0.0.1:7766</code>.</p></div>
+      <div class="cue"><span class="n">Q9</span><code>runthrough --install-hook</code><p>Rehearse before every push: a pre-push hook runs the <code>push</code> workflows on the commit being pushed.</p></div>
     </div>
   </div>
 </section>
@@ -422,7 +432,7 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
     <div class="section-head">
       <span class="tape">Understudies</span>
       <h2>What stays different from GitHub</h2>
-      <p>A local rehearsal can't do everything the real stage does. These are the known gaps.</p>
+      <p>A local rehearsal can't do everything the real stage does. These are the known gaps, and a run says so when a job uses one of them.</p>
     </div>
     <div class="gaps">
       <div><strong>Cache service v2</strong>The <code>ACTIONS_CACHE_SERVICE_V2</code> API is not served. The v1 API is.</div>
@@ -438,7 +448,7 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
     <div class="section-head">
       <span class="tape">Curtain call</span>
       <h2>Exit codes you can script</h2>
-      <p>Use runthrough as a pre-push hook or in your own scripts. Secrets come from <code>-s</code> or <code>.secrets</code>, variables from <code>--var</code> or <code>.vars</code>.</p>
+      <p><code>runthrough --install-hook</code> makes it a pre-push hook; use it in your own scripts too. Secrets come from <code>-s</code> or <code>.secrets</code>, variables from <code>--var</code> or <code>.vars</code>.</p>
     </div>
     <div class="exits">
       <div class="exit"><b>0</b><p>Every job succeeded or was skipped.</p></div>
@@ -449,7 +459,7 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
 </section>
 
 <footer class="wrap foot">
-  <span>runthrough 0.1.0 · MIT license</span>
+  <span>runthrough · MIT license</span>
   <a href="https://github.com/simota/runthrough">github.com/simota/runthrough</a>
 </footer>
 
