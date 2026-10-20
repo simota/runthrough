@@ -1644,3 +1644,95 @@ fn run_name_does_not_print_a_secret() {
     assert!(out.contains("| long=***"), "{out}");
     assert!(!out.contains("word123"), "{out}");
 }
+
+/// A run closes with one line for all its workflows; jobs that use something a
+/// local run does not reproduce say so when they start.
+#[test]
+fn run_ends_with_a_curtain_line_and_understudy_notes() {
+    let (code, out) = runthrough(&["push", "-j", "build"]);
+    assert_eq!(code, 0, "{out}");
+    let last = out.lines().last().unwrap_or_default();
+    assert!(
+        last.starts_with("🏁 1 workflow, 1 job: 1 succeeded in "),
+        "{out}"
+    );
+
+    let repo = TempRepo::new();
+    repo.workflow(
+        "w.yml",
+        "on: push\npermissions: read-all\njobs:\n  w:\n    runs-on: ubuntu-latest\n    environment: prod\n    steps:\n      - run: exit 1\n",
+    );
+    let out = repo.run(&["--host", "--no-cache-server"]);
+    assert!(
+        out.contains("ℹ️  permissions are not enforced locally"),
+        "{out}"
+    );
+    assert!(
+        out.contains("ℹ️  environment secrets and protection rules are not applied locally"),
+        "{out}"
+    );
+    assert!(
+        out.lines()
+            .last()
+            .unwrap_or_default()
+            .starts_with("❌ 1 workflow, 1 job: 1 failed in "),
+        "{out}"
+    );
+}
+
+/// `--committed` checks out the HEAD commit; the default copy says what it adds.
+#[test]
+fn committed_rehearses_the_head_commit() {
+    let repo = TempRepo::new();
+    repo.workflow(
+        "w.yml",
+        "on: push\njobs:\n  w:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo \"file=$(cat a.txt)\"; test ! -e new.txt || echo \"new=$(cat new.txt)\"\n",
+    );
+    std::fs::write(repo.path().join("a.txt"), "committed").unwrap();
+    let git = |args: &[&str]| {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    git(&["add", "."]);
+    git(&["commit", "--quiet", "-m", "c"]);
+    std::fs::write(repo.path().join("a.txt"), "edited").unwrap();
+    std::fs::write(repo.path().join("new.txt"), "untracked").unwrap();
+
+    let out = repo.run(&["--host", "--no-cache-server"]);
+    assert!(
+        out.contains("file=edited") && out.contains("new=untracked"),
+        "{out}"
+    );
+    assert!(
+        out.contains("(working tree, 2 uncommitted changes; --committed leaves them out)"),
+        "{out}"
+    );
+    let out = repo.run(&["--host", "--no-cache-server", "--committed"]);
+    assert!(
+        out.contains("file=committed") && !out.contains("new=untracked"),
+        "{out}"
+    );
+    assert!(out.contains("checked out commit "), "{out}");
+}
+
+/// An event that triggers nothing names the events that would, with their commands.
+#[test]
+fn nothing_triggered_names_other_events() {
+    let repo = TempRepo::new();
+    repo.workflow(
+        "w.yml",
+        "on: pull_request\njobs:\n  w:\n    runs-on: ubuntu-latest\n    steps: [{run: 'true'}]\n",
+    );
+    let out = repo.run(&["--host", "--no-cache-server"]);
+    assert!(out.contains("no workflows triggered by 'push'"), "{out}");
+    assert!(
+        out.contains("  pull_request: 1 workflow → runthrough pull_request"),
+        "{out}"
+    );
+}

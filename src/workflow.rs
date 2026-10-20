@@ -19,6 +19,8 @@ pub struct Workflow {
     pub defaults: Option<Defaults>,
     #[serde(default)]
     pub concurrency: Yaml,
+    #[serde(default)]
+    pub permissions: Yaml,
     #[serde(rename = "cache-mode")]
     pub cache_mode: Option<String>,
     pub jobs: IndexMap<String, Job>,
@@ -74,6 +76,8 @@ pub struct Job {
     pub environment: Yaml,
     #[serde(default)]
     pub concurrency: Yaml,
+    #[serde(default)]
+    pub permissions: Yaml,
     #[serde(rename = "cache-mode")]
     pub cache_mode: Option<String>,
 }

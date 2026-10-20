@@ -1,0 +1,31 @@
+<!doctype html>
+<!-- Source of og.png, the share image (1200×630). Render it again after an edit:
+     chrome --headless --screenshot=docs/og.png --window-size=1200,630 docs/og.html -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>runthrough share image</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Stencil+Display:wght@900&family=Instrument+Sans:wght@500&family=JetBrains+Mono:wght@600&display=block">
+<style>
+html, body { margin: 0; width: 1200px; height: 630px; overflow: hidden; }
+body {
+  background: radial-gradient(circle at 70% 18%, rgba(255, 214, 120, .38), transparent 42%), #101214;
+  color: #d8dde2; font-family: "Instrument Sans", "Helvetica Neue", Arial, sans-serif;
+  display: grid; align-content: center; gap: 36px; padding: 0 96px; box-sizing: border-box;
+}
+.tape {
+  justify-self: start; background: #f3c21c; color: #1a1a17; transform: rotate(-2deg);
+  font: 900 150px/1 "Big Shoulders Stencil Display", "Arial Narrow", Impact, sans-serif;
+  letter-spacing: .02em; text-transform: uppercase; padding: 22px 48px 14px;
+  clip-path: polygon(1% 0, 99% 4%, 100% 50%, 98% 100%, 0 96%, 0 45%);
+}
+p { margin: 0; font-size: 46px; font-weight: 500; }
+code { font: 600 28px/1 "JetBrains Mono", monospace; color: #7d858e; }
+</style>
+</head>
+<body>
+  <div class="tape">runthrough</div>
+  <p>The full rehearsal before you push.</p>
+  <code>$ runthrough   # GitHub Actions, run locally</code>
+</body>
+</html>

@@ -129,6 +129,10 @@ pub struct Cli {
     /// Copy only files git does not ignore into the workspace (false copies ignored files too)
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     use_gitignore: bool,
+    /// Check out the HEAD commit's files instead of copying the working tree, so the run
+    /// sees what a push would (uncommitted and untracked changes are left out)
+    #[arg(long, conflicts_with = "bind")]
+    committed: bool,
     /// Run the real actions/checkout instead of copying the local repository
     #[arg(long)]
     no_skip_checkout: bool,
@@ -241,6 +245,9 @@ pub struct Cli {
     /// Print system information for a bug report, then exit
     #[arg(long)]
     bug_report: bool,
+    /// Install a git pre-push hook that runs the push workflows on the commit being pushed, then exit
+    #[arg(long)]
+    install_hook: bool,
     /// Print a man page, then exit
     #[arg(long)]
     man_page: bool,
@@ -397,13 +404,30 @@ fn main() {
         print!("{}", info::bug_report(&cli.engine, &cache_base()));
         return;
     }
+    if cli.install_hook {
+        match info::install_hook(&cli.directory) {
+            Ok(hook) => println!(
+                "installed {}: each git push first runs `runthrough --committed --quiet push` (skip it once with git push --no-verify)",
+                hook.display()
+            ),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     if cli.dashboard {
         if let Err(e) = dashboard::serve(cache_base(), &cli.dashboard_addr, cli.dashboard_port) {
             eprintln!("error: {e:#}");
             std::process::exit(2);
         }
     }
-    let result = if cli.watch { watch(&cli) } else { run(&cli) };
+    let result = if cli.watch {
+        watch(&cli)
+    } else {
+        run(&cli).map(|o| o.ok)
+    };
     match result {
         Ok(true) => {}
         Ok(false) => std::process::exit(1),
@@ -417,11 +441,18 @@ fn main() {
 /// Run once, then again every time the repository's files change.
 fn watch(cli: &Cli) -> Result<bool> {
     let root = cli.directory.canonicalize()?;
+    let mut last: Option<Outcome> = None;
     loop {
         // Taken before the run, so a change made while it runs triggers the next one.
         let before = info::fingerprint(&root);
-        if let Err(e) = run(cli) {
-            eprintln!("error: {e:#}");
+        match run(cli) {
+            Ok(outcome) => {
+                if let Some(line) = last.as_ref().and_then(|l| outcome.since(l)) {
+                    println!("{line}");
+                }
+                last = Some(outcome);
+            }
+            Err(e) => eprintln!("error: {e:#}"),
         }
         eprintln!(
             "👀 watching {} for changes (Ctrl-C to stop)",
@@ -450,6 +481,10 @@ fn load_workflows(cli: &Cli, wf_paths: &[PathBuf]) -> Result<(Vec<workflow::Work
     let mut errors = Vec::new();
     let mut files = Vec::new();
     for p in wf_paths {
+        // A missing default directory is reported below as no workflow files.
+        if cli.workflows.is_none() && !p.is_dir() {
+            continue;
+        }
         files.extend(workflow::discover(p, !cli.no_recurse)?);
     }
     for f in files {
@@ -468,12 +503,48 @@ fn load_workflows(cli: &Cli, wf_paths: &[PathBuf]) -> Result<(Vec<workflow::Work
             bail!("{}", errors.join("\n"));
         }
         let dirs: Vec<_> = wf_paths.iter().map(|p| p.display().to_string()).collect();
+        if cli.workflows.is_none() {
+            bail!(
+                "no workflow files found in {} (runthrough reads .github/workflows, and .runthrough/workflows for workflows run only locally)",
+                dirs.join(", ")
+            );
+        }
         bail!("no workflow files found in {}", dirs.join(", "));
     }
     for e in &errors {
         eprintln!("error: {e}\n  (skipping this workflow)");
     }
     Ok((workflows, !errors.is_empty()))
+}
+
+/// What to try when `event` triggers nothing: up to three events the workflows
+/// do declare, most workflows first, each with its command; and, when some
+/// workflow declares `event` but its filters rejected the payload, how to skip them.
+fn trigger_cues(workflows: &[workflow::Workflow], event: &str) -> Vec<String> {
+    let mut counts: IndexMap<String, usize> = IndexMap::new();
+    for wf in workflows {
+        // A reusable workflow only runs through its caller.
+        for e in wf.events().into_iter().filter(|e| e != "workflow_call") {
+            *counts.entry(e).or_default() += 1;
+        }
+    }
+    let filtered = counts.shift_remove(event).is_some();
+    let mut events: Vec<(String, usize)> = counts.into_iter().collect();
+    events.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut cues: Vec<String> = events
+        .into_iter()
+        .take(3)
+        .map(|(e, n)| {
+            let workflows = if n == 1 { "workflow" } else { "workflows" };
+            format!("{e}: {n} {workflows} → runthrough {e}")
+        })
+        .collect();
+    if filtered {
+        cues.push(format!(
+            "-W <file> or -j <job> runs a workflow without its on.{event} filters"
+        ));
+    }
+    cues
 }
 
 /// Where to read workflows from: `-W` alone, or by default `.github/workflows`
@@ -492,7 +563,43 @@ fn workflow_paths(cli: &Cli, root: &Path) -> Vec<PathBuf> {
     }
 }
 
-fn run(cli: &Cli) -> Result<bool> {
+/// How a run ended: whether every job succeeded or was skipped, each job's
+/// result as `wf / job`, and the wall time.
+struct Outcome {
+    ok: bool,
+    jobs: Vec<(String, runner::JobResult)>,
+    secs: f64,
+}
+
+impl Outcome {
+    /// A run that ran no job (list, plan, validate, nothing triggered).
+    fn no_jobs(ok: bool) -> Outcome {
+        Outcome {
+            ok,
+            jobs: Vec::new(),
+            secs: 0.0,
+        }
+    }
+
+    /// The `--watch` line comparing this run with `last`; none when either ran no job.
+    fn since(&self, last: &Outcome) -> Option<String> {
+        if self.jobs.is_empty() || last.jobs.is_empty() {
+            return None;
+        }
+        let changed: Vec<(String, &str, &str)> = self
+            .jobs
+            .iter()
+            .filter_map(|(job, now)| {
+                let (_, before) = last.jobs.iter().find(|(j, _)| j == job)?;
+                (before != now).then(|| (job.clone(), before.as_str(), now.as_str()))
+            })
+            .collect();
+        Some(markers::since_last(&changed, self.secs, last.secs))
+    }
+}
+
+fn run(cli: &Cli) -> Result<Outcome> {
+    let started = std::time::Instant::now();
     let root = cli
         .directory
         .canonicalize()
@@ -505,7 +612,7 @@ fn run(cli: &Cli) -> Result<bool> {
             planner::stages(wf, None).with_context(|| format!("{}", wf.path.display()))?;
             println!("✅ {}", wf.path.display());
         }
-        return Ok(!load_failed);
+        return Ok(Outcome::no_jobs(!load_failed));
     }
 
     if cli.list {
@@ -529,7 +636,7 @@ fn run(cli: &Cli) -> Result<bool> {
                 }
             }
         }
-        return Ok(true);
+        return Ok(Outcome::no_jobs(true));
     }
 
     let event_name = if cli.detect_event {
@@ -579,7 +686,10 @@ fn run(cli: &Cli) -> Result<bool> {
             Some(j) => bail!("job '{j}' not found in any workflow"),
             None => {
                 println!("no workflows triggered by '{event_name}'");
-                return Ok(true);
+                for cue in trigger_cues(&workflows, &event_name) {
+                    println!("  {cue}");
+                }
+                return Ok(Outcome::no_jobs(true));
             }
         }
     }
@@ -591,7 +701,7 @@ fn run(cli: &Cli) -> Result<bool> {
                 info::graph(wf, &planner::stages(wf, cli.job.as_deref())?)
             );
         }
-        return Ok(true);
+        return Ok(Outcome::no_jobs(true));
     }
 
     if cli.dryrun {
@@ -601,7 +711,7 @@ fn run(cli: &Cli) -> Result<bool> {
                 println!("  stage {i}: {}", stage.join(", "));
             }
         }
-        return Ok(true);
+        return Ok(Outcome::no_jobs(true));
     }
 
     let given = Given::read(cli, &root)?;
@@ -640,6 +750,7 @@ fn run(cli: &Cli) -> Result<bool> {
         copy_mode: !cli.host && cli.engine.is_remote(),
         bind: cli.bind,
         use_gitignore: cli.use_gitignore,
+        committed: cli.committed,
         skip_checkout: !cli.no_skip_checkout,
         // Offline mode keeps present images; missing ones are still pulled.
         pull: cli.pull && !cli.action_offline_mode,
@@ -682,7 +793,7 @@ fn run(cli: &Cli) -> Result<bool> {
     };
     // Workflows triggered by the same event run side by side, as in act;
     // --concurrent-jobs still bounds the jobs across all of them.
-    let results: Vec<Result<bool>> = std::thread::scope(|s| {
+    let results: Vec<Result<(bool, runner::JobResults)>> = std::thread::scope(|s| {
         let handles: Vec<_> = selected
             .iter()
             .map(|wf| {
@@ -693,23 +804,83 @@ fn run(cli: &Cli) -> Result<bool> {
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| Ok(false)))
+            .map(|h| h.join().unwrap_or_else(|_| Ok((false, Vec::new()))))
             .collect()
     });
     let mut ok = !load_failed;
     let mut error = None;
-    for r in results {
+    let mut jobs = Vec::new();
+    for (wf, r) in selected.iter().zip(results) {
         match r {
-            Ok(r) => ok &= r,
+            Ok((r, results)) => {
+                ok &= r;
+                jobs.extend(
+                    results
+                        .into_iter()
+                        .map(|(id, result)| (format!("{} / {id}", wf.display_name()), result)),
+                );
+            }
             Err(e) => error = error.or(Some(e)),
         }
     }
     if let Some(h) = &cfg.shared.history {
         h.finish(ok && error.is_none());
     }
-    match error {
-        Some(e) => Err(e),
-        None => Ok(ok),
+    if let Some(e) = error {
+        return Err(e);
+    }
+    let outcome = Outcome {
+        ok,
+        jobs,
+        secs: started.elapsed().as_secs_f64(),
+    };
+    print_curtain(cli, selected.len(), &outcome, cfg.shared.history.as_deref());
+    Ok(outcome)
+}
+
+/// The run's closing line (`markers::curtain`), or one JSON object with `--json`.
+fn print_curtain(
+    cli: &Cli,
+    workflows: usize,
+    outcome: &Outcome,
+    history: Option<&history::Recorder>,
+) {
+    let url = history.filter(|_| cli.dashboard_port != 0).map(|h| {
+        format!(
+            "http://{}:{}/#/run/{}",
+            cli.dashboard_addr,
+            cli.dashboard_port,
+            h.id()
+        )
+    });
+    let results: Vec<&str> = outcome.jobs.iter().map(|(_, r)| r.as_str()).collect();
+    if cli.json {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        println!(
+            "{}",
+            serde_json::json!({
+                "time": now,
+                "ok": outcome.ok,
+                "workflows": workflows,
+                "jobs": outcome.jobs.iter().map(|(j, r)| serde_json::json!({"job": j, "result": r})).collect::<Vec<_>>(),
+                "secs": outcome.secs,
+                "url": url,
+            })
+        );
+    } else {
+        println!(
+            "{}",
+            markers::curtain(
+                outcome.ok,
+                workflows,
+                &results,
+                outcome.secs,
+                url.as_deref()
+            )
+        );
     }
 }
 
@@ -892,6 +1063,11 @@ fn start_history(
     meta.insert("sha".into(), serde_json::json!(repo.sha));
     meta.insert("event".into(), serde_json::json!(event_name));
     meta.insert(
+        "version".into(),
+        serde_json::json!(env!("CARGO_PKG_VERSION")),
+    );
+    meta.insert("committed".into(), serde_json::json!(cli.committed));
+    meta.insert(
         "engine".into(),
         serde_json::json!(if cli.host {
             "host"
@@ -928,6 +1104,38 @@ fn start_history(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn trigger_cues_name_declared_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |name: &str, on: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(
+                &path,
+                format!("on: {on}\njobs:\n  a:\n    runs-on: x\n    steps: [{{run: a}}]\n"),
+            )
+            .unwrap();
+            workflow::Workflow::load(&path).unwrap()
+        };
+        let workflows = [
+            load("a.yml", "[pull_request, push]"),
+            load("b.yml", "pull_request"),
+            load("c.yml", "workflow_call"),
+            load("d.yml", "[release, schedule, label]"),
+        ];
+        assert_eq!(
+            trigger_cues(&workflows, "issues"),
+            [
+                "pull_request: 2 workflows → runthrough pull_request",
+                "label: 1 workflow → runthrough label",
+                "push: 1 workflow → runthrough push",
+            ]
+        );
+        assert_eq!(
+            trigger_cues(&workflows, "push").last().unwrap(),
+            "-W <file> or -j <job> runs a workflow without its on.push filters"
+        );
+    }
 
     #[test]
     fn watch_checks_take_at_most_a_tenth_of_the_time() {

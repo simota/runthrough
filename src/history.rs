@@ -65,6 +65,15 @@ impl Recorder {
         let _ = self.log.lock().unwrap().write_all(line.as_bytes());
     }
 
+    /// The run's ID, as the dashboard's URLs name it.
+    pub fn id(&self) -> String {
+        self.dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    }
+
     pub fn finish(&self, ok: bool) {
         // The whole log is on disk before the result marks the run finished.
         let _ = self.log.lock().unwrap().flush();
@@ -252,8 +261,9 @@ impl Store {
         tail.update(&dir.join("log.jsonl"));
         let jobs = tail.summary.jobs(&[]);
         let run_names = tail.summary.run_names.clone();
+        let summaries = tail.summary.summaries.clone();
         Some(
-            json!({"meta": meta, "status": status, "finished": finished, "jobs": jobs, "run_names": run_names}),
+            json!({"meta": meta, "status": status, "finished": finished, "jobs": jobs, "run_names": run_names, "summaries": summaries}),
         )
     }
 
@@ -297,6 +307,8 @@ pub struct Summary {
     jobs: Vec<Job>,
     results: Vec<(String, String, String)>,
     run_names: Vec<Value>,
+    /// Step summaries (`GITHUB_STEP_SUMMARY`), in the order steps wrote them.
+    summaries: Vec<Value>,
     /// Without it each step keeps only its line count and last line.
     keep_lines: bool,
 }
@@ -307,6 +319,7 @@ impl Summary {
             jobs: vec![],
             results: vec![],
             run_names: vec![],
+            summaries: vec![],
             keep_lines,
         }
     }
@@ -321,6 +334,11 @@ impl Summary {
         };
         if let Some(result) = r["result"].as_str() {
             self.results.push((wf.into(), job.into(), result.into()));
+            return;
+        }
+        if let Some(markdown) = r["summary"].as_str() {
+            self.summaries
+                .push(json!({"workflow": wf, "job": job, "markdown": markdown}));
             return;
         }
         let Some(msg) = r["msg"].as_str() else {
@@ -389,6 +407,8 @@ struct Job {
     secs: Option<f64>,
     error: Option<String>,
     steps: Vec<Step>,
+    /// What the run did not reproduce locally (`markers::note`), each once.
+    notes: Vec<String>,
     keep_lines: bool,
 }
 
@@ -403,6 +423,7 @@ impl Job {
             secs: None,
             error: None,
             steps: vec![],
+            notes: vec![],
             keep_lines,
         }
     }
@@ -515,6 +536,11 @@ impl Job {
             self.push(name, "running", t);
             return;
         }
+        if let Some(note) = markers::parse_note(msg) {
+            if !self.notes.iter().any(|n| n == note) {
+                self.notes.push(note.to_string());
+            }
+        }
         if let Some(name) = markers::parse_step_skipped(msg) {
             self.push(name, "skipped", t);
             return;
@@ -574,7 +600,7 @@ impl Job {
         json!({
             "workflow": self.workflow, "job": self.job, "id": id, "status": status,
             "started": self.started, "secs": self.secs, "runs_on": self.runs_on,
-            "error": self.error, "steps": steps,
+            "error": self.error, "steps": steps, "notes": self.notes,
         })
     }
 }
@@ -593,6 +619,36 @@ mod tests {
             s.feed(r);
         }
         s.jobs(&[])
+    }
+
+    #[test]
+    fn keeps_step_summaries_and_notes() {
+        let mut s = Summary::new(false);
+        for r in [
+            rec("build", &markers::job_start("host")),
+            rec(
+                "build",
+                &markers::note("permissions are not enforced locally"),
+            ),
+            rec(
+                "build",
+                &markers::note("permissions are not enforced locally"),
+            ),
+            json!({"t": 1.0, "wf": "demo", "job": "build", "summary": "## Tests\n| ok |"}),
+            rec("build", &markers::job_end("success", 1.0)),
+        ] {
+            s.feed(&r);
+        }
+        assert_eq!(
+            s.summaries,
+            [json!({"workflow": "demo", "job": "build", "markdown": "## Tests\n| ok |"})]
+        );
+        let jobs = s.jobs(&[]);
+        assert_eq!(
+            jobs[0]["notes"],
+            json!(["permissions are not enforced locally"])
+        );
+        assert_eq!(jobs[0]["status"], "success");
     }
 
     #[test]

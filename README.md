@@ -26,7 +26,13 @@ runthrough --watch              # rerun whenever a file changes
 runthrough --graph              # draw the job graph
 runthrough --dashboard          # browse recorded runs at http://127.0.0.1:7766
 runthrough --validate --strict  # check the workflows, then exit
+runthrough --committed          # rehearse the HEAD commit, leaving uncommitted changes out
+runthrough --install-hook       # add a git pre-push hook that runs the push workflows first
 ```
+
+A run ends with one line for all of its workflows: jobs by result, the time it took and, when it was recorded, its dashboard URL. With `--watch`, each rerun also says which jobs changed result since the last one.
+
+`--install-hook` writes `.git/hooks/pre-push` (or the hook in `core.hooksPath`), never over an existing hook. It runs `runthrough --committed --quiet push`, so the commit being pushed is rehearsed rather than the working tree, and a failed job stops the push; `git push --no-verify` skips it once. Add flags such as `--host` to the hook's `runthrough` line.
 
 Workflows are read from `.github/workflows` and, laid out the same way, `.runthrough/workflows` (for workflows meant only for local runs); `-W` reads a single file or directory instead.
 
@@ -47,7 +53,7 @@ Flags win over files. Arguments from `.actrc` files are read before the command 
 
 ### Dashboard
 
-Every run is recorded (with secrets masked) under `~/.cache/runthrough/runs`, and `runthrough --dashboard` serves a local web UI over them in the style of GitHub's Actions tab: the runs list (optionally grouped by repository or date), a run's job graph by stage with its matrix legs and annotations, and each job's steps with their logs, refreshed while a run is in progress. A failed job's page has **Copy for LLM**, which copies the job's context, its steps and the last 200 lines of each failed step as Markdown to paste into an LLM. **Resources** lists the ports runthrough listens on and the Docker containers, networks and volumes it created, with the run each belongs to; ones whose run has ended are marked left behind, with a command to remove them. `--dashboard-addr` / `--dashboard-port` change where it listens; `--no-history` skips recording a run, and runs with `--insecure-secrets` are never recorded. The newest 100 runs are kept.
+Every run is recorded (with secrets masked) under `~/.cache/runthrough/runs`, and `runthrough --dashboard` serves a local web UI over them in the style of GitHub's Actions tab: the runs list (optionally grouped by repository or date), a run's job graph by stage with its matrix legs and annotations, and each job's steps with their logs, refreshed while a run is in progress. A run's summary page shows the jobs' step summaries (`GITHUB_STEP_SUMMARY`, as Markdown) and, as annotations, what the run did not reproduce locally; **Copy rehearsal note** copies the jobs and their results as Markdown for a pull request. A failed job's page has **Copy for LLM**, which copies the job's context, its steps and the last 200 lines of each failed step as Markdown to paste into an LLM. **Resources** lists the ports runthrough listens on and the Docker containers, networks and volumes it created, with the run each belongs to; ones whose run has ended are marked left behind, with a command to remove them. `--dashboard-addr` / `--dashboard-port` change where it listens; `--no-history` skips recording a run, and runs with `--insecure-secrets` are never recorded. The newest 100 runs are kept.
 
 ### Exit codes
 
@@ -72,7 +78,7 @@ Steps see `RUNTHROUGH=true` and `ACT=true` (also in the `env` context, so workfl
 
 ## Not supported
 
-The cache service v2 API (`ACTIONS_CACHE_SERVICE_V2`). `permissions` and `jobs.<id>.snapshot` are validated but have no local effect; `environment` is reported (name and `url`) without environment secrets or protection rules. `concurrency` groups span one `runthrough` invocation, and a job cancelled by `cancel-in-progress` stops before its next step.
+A job using one of these logs a note (`ℹ️`) when it starts. The cache service v2 API (`ACTIONS_CACHE_SERVICE_V2`). `permissions` and `jobs.<id>.snapshot` are validated but have no local effect; `environment` is reported (name and `url`) without environment secrets or protection rules. `concurrency` groups span one `runthrough` invocation, and a job cancelled by `cancel-in-progress` stops before its next step.
 
 ## Platforms
 

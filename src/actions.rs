@@ -368,16 +368,29 @@ pub fn list_repo_files(root: &Path, exclude_ignored: bool) -> Vec<PathBuf> {
 
 /// Copy the local repository into `dest` (emulates `actions/checkout`).
 /// Tracked and untracked files are copied, plus `.git`; ignored files only
-/// when `use_gitignore` is false. Objects come from `objects`.
+/// when `use_gitignore` is false. With `committed`, only `.git` is copied and
+/// the HEAD commit's files are checked out of it, so uncommitted and untracked
+/// changes stay behind. Objects come from `objects`.
 pub fn copy_repo(
     src: &Path,
     dest: &Path,
     use_gitignore: bool,
+    committed: bool,
     objects: &ObjectSnapshot,
 ) -> Result<()> {
-    let files = list_repo_files(src, use_gitignore);
-    let mut plan: Vec<(PathBuf, Place)> = files.into_iter().map(|f| (f, Place::Copy)).collect();
     let git_dir = src.join(".git");
+    if committed && !git_dir.is_dir() {
+        bail!(
+            "--committed needs the repository's .git directory ({} is not one; worktrees and submodules are not supported)",
+            git_dir.display()
+        );
+    }
+    let files = if committed {
+        Vec::new()
+    } else {
+        list_repo_files(src, use_gitignore)
+    };
+    let mut plan: Vec<(PathBuf, Place)> = files.into_iter().map(|f| (f, Place::Copy)).collect();
     if git_dir.is_dir() {
         let (shared, own): (Vec<PathBuf>, Vec<PathBuf>) = walkdir::WalkDir::new(&git_dir)
             .into_iter()
@@ -415,7 +428,40 @@ pub fn copy_repo(
                 }
             }
         }
-    })
+    })?;
+    if committed {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dest)
+            .args(["reset", "--quiet", "--hard", "HEAD"])
+            .output()?;
+        if !out.status.success() {
+            bail!(
+                "--committed: checking out the HEAD commit failed (no commit yet?): {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// How many changes `git status` shows in `root` (uncommitted, untracked);
+/// none when git cannot tell.
+pub fn uncommitted_changes(root: &Path) -> usize {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        // One line per change; a path with a newline is quoted by git.
+        .map_or(0, |o| {
+            o.stdout
+                .split(|b| *b == b'\n')
+                .filter(|l| !l.is_empty())
+                .count()
+        })
 }
 
 /// `f` for every item, on a few threads: copying file by file is bound by
@@ -531,7 +577,7 @@ mod tests {
 
         let objects = ObjectSnapshot::default();
         let first = tempfile::tempdir().unwrap();
-        copy_repo(src.path(), first.path(), true, &objects).unwrap();
+        copy_repo(src.path(), first.path(), true, false, &objects).unwrap();
         for n in 0..200 {
             let f = first.path().join(format!("d{}/f{n}.txt", n % 7));
             assert_eq!(std::fs::read_to_string(f).unwrap(), format!("{n}"));
@@ -545,7 +591,7 @@ mod tests {
         git(src.path(), &["add", "late.txt"]);
         git(src.path(), &["commit", "--quiet", "-m", "late"]);
         let second = tempfile::tempdir().unwrap();
-        copy_repo(src.path(), second.path(), true, &objects).unwrap();
+        copy_repo(src.path(), second.path(), true, false, &objects).unwrap();
         assert_eq!(git(second.path(), &["log", "--format=%s"]), "late\nc");
         git(second.path(), &["fsck", "--no-progress"]);
 
@@ -566,6 +612,46 @@ mod tests {
             assert_ne!(meta(first.path()).ino(), meta(src.path()).ino());
             assert_eq!(meta(src.path()).nlink(), 1);
         }
+    }
+
+    #[test]
+    fn committed_copy_leaves_uncommitted_changes_behind() {
+        let src = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(src.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "--quiet"]);
+        let objects = ObjectSnapshot::default();
+        let empty = tempfile::tempdir().unwrap();
+        assert!(copy_repo(src.path(), empty.path(), true, true, &objects).is_err());
+
+        std::fs::write(src.path().join("a.txt"), "committed").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "--quiet", "-m", "c"]);
+        std::fs::write(src.path().join("a.txt"), "edited").unwrap();
+        std::fs::write(src.path().join("new.txt"), "untracked").unwrap();
+        assert_eq!(uncommitted_changes(src.path()), 2);
+
+        let dest = tempfile::tempdir().unwrap();
+        copy_repo(
+            src.path(),
+            dest.path(),
+            true,
+            true,
+            &ObjectSnapshot::default(),
+        )
+        .unwrap();
+        let a = std::fs::read_to_string(dest.path().join("a.txt")).unwrap();
+        assert_eq!(a, "committed");
+        assert!(!dest.path().join("new.txt").exists());
+        assert_eq!(uncommitted_changes(dest.path()), 0);
     }
 
     #[test]
