@@ -176,9 +176,10 @@ impl RepoInfo {
 
     /// A pull_request payload for HEAD when no event file is given: a PR from
     /// the current branch (`head`) into the default branch (`base`), so
-    /// `github.base_ref`/`head_ref` are set. `base.sha` is `<remote>/<default>`
-    /// unless it is HEAD itself, where `on.pull_request.paths` would see no
-    /// changes. No `action`, so every `types` filter passes.
+    /// `github.base_ref`/`head_ref` are set. `base.sha` is `<remote>/<default>`,
+    /// or the local `<default>` without it, unless it is HEAD itself, where
+    /// `on.pull_request.paths` would see no changes. No `action`, so every
+    /// `types` filter passes.
     pub fn pull_request_event(&self, remote: &str, default_branch: &str) -> Value {
         let mut event = json!({
             "pull_request": {
@@ -186,15 +187,14 @@ impl RepoInfo {
                 "base": {"ref": default_branch},
             },
         });
-        let base_sha = git(
-            &self.root,
-            &[
-                "rev-parse",
-                "--verify",
-                "-q",
-                &format!("refs/remotes/{remote}/{default_branch}^{{commit}}"),
-            ],
-        );
+        let commit = |r: String| {
+            git(
+                &self.root,
+                &["rev-parse", "--verify", "-q", &format!("{r}^{{commit}}")],
+            )
+        };
+        let base_sha = commit(format!("refs/remotes/{remote}/{default_branch}"))
+            .or_else(|| commit(format!("refs/heads/{default_branch}")));
         if let Some(sha) = base_sha.filter(|s| *s != self.sha) {
             event["pull_request"]["base"]["sha"] = json!(sha);
         }
@@ -510,6 +510,42 @@ mod tests {
         run(&["update-ref", "refs/remotes/origin/main", "topic"]);
         let repo = RepoInfo::detect(dir.path(), "origin");
         assert_eq!(repo.push_before("origin"), None);
+    }
+
+    #[test]
+    fn pull_request_base_sha_is_the_remote_or_local_default_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let ok = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@x"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let base_sha = |remote: &str| {
+            let repo = RepoInfo::detect(dir.path(), remote);
+            repo.pull_request_event(remote, "main")["pull_request"]["base"]["sha"].clone()
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "a"]);
+        let a = git(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        // On the default branch itself: no base.sha.
+        assert_eq!(base_sha("origin"), Value::Null);
+        run(&["checkout", "-q", "-b", "topic"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "b"]);
+        // No remote-tracking ref: the local default branch.
+        assert_eq!(base_sha("origin"), a.as_str());
+        run(&["update-ref", "refs/remotes/origin/main", "topic"]);
+        run(&["commit", "-q", "--allow-empty", "-m", "c"]);
+        let b = git(dir.path(), &["rev-parse", "HEAD~1"]).unwrap();
+        // The remote-tracking ref wins over the local branch.
+        assert_eq!(base_sha("origin"), b.as_str());
+        let event = RepoInfo::detect(dir.path(), "origin").pull_request_event("origin", "main");
+        assert_eq!(event["pull_request"]["head"]["ref"], "topic");
     }
 
     #[test]
