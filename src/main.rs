@@ -129,8 +129,8 @@ pub struct Cli {
     /// Copy only files git does not ignore into the workspace (false copies ignored files too)
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     use_gitignore: bool,
-    /// Check out the HEAD commit's files instead of copying the working tree, so the run
-    /// sees what a push would (uncommitted and untracked changes are left out)
+    /// Run the HEAD commit's workflows and check out its files instead of the working tree,
+    /// so the run sees what a push would (uncommitted and untracked changes are left out)
     #[arg(long, conflicts_with = "bind")]
     committed: bool,
     /// Run the real actions/checkout instead of copying the local repository
@@ -476,19 +476,36 @@ fn watch_delay(check: std::time::Duration) -> std::time::Duration {
 
 /// Load every workflow; files that fail are reported and skipped (as act does),
 /// and the run fails only when none loads. The flag says whether any failed.
-fn load_workflows(cli: &Cli, wf_paths: &[PathBuf]) -> Result<(Vec<workflow::Workflow>, bool)> {
+/// With `head` (`--committed`: the repository at `root` as its HEAD commit
+/// has it), files under `root` are read from there, keeping their names.
+fn load_workflows(
+    cli: &Cli,
+    wf_paths: &[PathBuf],
+    root: &Path,
+    head: Option<&Path>,
+) -> Result<(Vec<workflow::Workflow>, bool)> {
     let mut workflows = Vec::new();
     let mut errors = Vec::new();
     let mut files = Vec::new();
     for p in wf_paths {
+        let (from, to) = match (head, p.strip_prefix(root)) {
+            (Some(head), Ok(rel)) => (head.join(rel), p.clone()),
+            _ => (p.clone(), p.clone()),
+        };
         // A missing default directory is reported below as no workflow files.
-        if cli.workflows.is_none() && !p.is_dir() {
+        if cli.workflows.is_none() && !from.is_dir() {
             continue;
         }
-        files.extend(workflow::discover(p, !cli.no_recurse)?);
+        for f in workflow::discover(&from, !cli.no_recurse)? {
+            let name = match f.strip_prefix(&from) {
+                Ok(rel) if !rel.as_os_str().is_empty() => to.join(rel),
+                _ => to.clone(),
+            };
+            files.push((f, name));
+        }
     }
-    for f in files {
-        match workflow::Workflow::load(&f).and_then(|wf| {
+    for (f, name) in files {
+        match workflow::Workflow::load_as(&f, &name).and_then(|wf| {
             if cli.strict {
                 workflow::strict_check(&f)?;
             }
@@ -604,8 +621,13 @@ fn run(cli: &Cli) -> Result<Outcome> {
         .directory
         .canonicalize()
         .with_context(|| format!("{}", cli.directory.display()))?;
+    let head = cli
+        .committed
+        .then(|| actions::export_head(&root))
+        .transpose()?;
     let wf_paths = workflow_paths(cli, &root);
-    let (workflows, load_failed) = load_workflows(cli, &wf_paths)?;
+    let (workflows, load_failed) =
+        load_workflows(cli, &wf_paths, &root, head.as_ref().map(|d| d.path()))?;
 
     if cli.validate {
         for wf in &workflows {
@@ -744,7 +766,7 @@ fn run(cli: &Cli) -> Result<Outcome> {
         copy_mode: !cli.host && cli.engine.is_remote(),
         bind: cli.bind,
         use_gitignore: cli.use_gitignore,
-        committed: cli.committed,
+        committed: head.as_ref().map(|d| d.path().to_path_buf()),
         skip_checkout: !cli.no_skip_checkout,
         // Offline mode keeps present images; missing ones are still pulled.
         pull: cli.pull && !cli.action_offline_mode,
@@ -1109,7 +1131,7 @@ mod tests {
                 format!("on: {on}\njobs:\n  a:\n    runs-on: x\n    steps: [{{run: a}}]\n"),
             )
             .unwrap();
-            workflow::Workflow::load(&path).unwrap()
+            workflow::Workflow::load_as(&path, &path).unwrap()
         };
         let workflows = [
             load("a.yml", "[pull_request, push]"),

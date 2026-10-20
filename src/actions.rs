@@ -445,6 +445,42 @@ pub fn copy_repo(
     Ok(())
 }
 
+/// The files of `root`'s HEAD commit, exported into a new temporary directory
+/// (`git archive`), for `--committed` to read workflows as the commit has them.
+pub fn export_head(root: &Path) -> Result<tempfile::TempDir> {
+    let dir = tempfile::Builder::new()
+        .prefix("runthrough-head")
+        .tempdir()?;
+    let mut git = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["archive", "--format=tar", "HEAD"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("running git archive")?;
+    let tar = Command::new("tar")
+        .arg("-xf")
+        .arg("-")
+        .arg("-C")
+        .arg(dir.path())
+        .stdin(git.stdout.take().expect("piped stdout"))
+        .status()
+        .context("running tar")?;
+    let out = git.wait_with_output()?;
+    if !out.status.success() {
+        bail!(
+            "--committed needs a HEAD commit in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    if !tar.success() {
+        bail!("extracting the HEAD commit of {} failed", root.display());
+    }
+    Ok(dir)
+}
+
 /// How many changes `git status` shows in `root` (uncommitted, untracked);
 /// none when git cannot tell.
 pub fn uncommitted_changes(root: &Path) -> usize {

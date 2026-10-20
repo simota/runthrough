@@ -1678,14 +1678,19 @@ fn run_ends_with_a_curtain_line_and_understudy_notes() {
     );
 }
 
-/// `--committed` checks out the HEAD commit; the default copy says what it adds.
+/// `--committed` checks out the HEAD commit and runs the workflows it has;
+/// the default copy says what it adds.
 #[test]
 fn committed_rehearses_the_head_commit() {
     let repo = TempRepo::new();
-    repo.workflow(
-        "w.yml",
-        "on: push\njobs:\n  w:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo \"file=$(cat a.txt)\"; test ! -e new.txt || echo \"new=$(cat new.txt)\"\n",
-    );
+    let caller = |extra: &str| {
+        format!("on: push\njobs:\n  w:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: echo \"file=$(cat a.txt)\"; test ! -e new.txt || echo \"new=$(cat new.txt)\"\n{extra}  c:\n    uses: ./.github/workflows/called.yml\n")
+    };
+    let called = |word: &str| {
+        format!("on: workflow_call\njobs:\n  c:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo called={word}\n")
+    };
+    repo.workflow("w.yml", &caller(""));
+    repo.workflow("called.yml", &called("committed"));
     std::fs::write(repo.path().join("a.txt"), "committed").unwrap();
     let git = |args: &[&str]| {
         assert!(Command::new("git")
@@ -1701,6 +1706,8 @@ fn committed_rehearses_the_head_commit() {
     git(&["commit", "--quiet", "-m", "c"]);
     std::fs::write(repo.path().join("a.txt"), "edited").unwrap();
     std::fs::write(repo.path().join("new.txt"), "untracked").unwrap();
+    repo.workflow("w.yml", &caller("      - run: echo wf=edited\n"));
+    repo.workflow("called.yml", &called("edited"));
 
     let out = repo.run(&["--host", "--no-cache-server"]);
     assert!(
@@ -1708,12 +1715,20 @@ fn committed_rehearses_the_head_commit() {
         "{out}"
     );
     assert!(
-        out.contains("(working tree, 2 uncommitted changes; --committed leaves them out)"),
+        out.contains("wf=edited") && out.contains("called=edited"),
+        "{out}"
+    );
+    assert!(
+        out.contains("(working tree, 4 uncommitted changes; --committed leaves them out)"),
         "{out}"
     );
     let out = repo.run(&["--host", "--no-cache-server", "--committed"]);
     assert!(
         out.contains("file=committed") && !out.contains("new=untracked"),
+        "{out}"
+    );
+    assert!(
+        out.contains("called=committed") && !out.contains("=edited"),
         "{out}"
     );
     assert!(out.contains("checked out commit "), "{out}");

@@ -32,7 +32,7 @@ runthrough --install-hook       # add a git pre-push hook that runs the push wor
 
 A run ends with one line for all of its workflows: jobs by result, the time it took and, when it was recorded, its dashboard URL. With `--watch`, each rerun also says which jobs changed result since the last one.
 
-`--install-hook` writes `.git/hooks/pre-push` (or the hook in `core.hooksPath`), never over an existing hook. It runs `runthrough --committed --quiet push`, so the commit being pushed is rehearsed rather than the working tree, and a failed job stops the push; `git push --no-verify` skips it once. Add flags such as `--host` to the hook's `runthrough` line.
+`--install-hook` writes `.git/hooks/pre-push` (or the hook in `core.hooksPath`), never over an existing hook. It runs `runthrough --committed --quiet push`, so the commit being pushed is rehearsed rather than the working tree (its checkout and the workflows themselves come from HEAD), and a failed job stops the push, as does pushing a commit other than HEAD, which the hook does not rehearse; `git push --no-verify` skips it once. Add flags such as `--host` to the hook's `runthrough` line.
 
 Workflows are read from `.github/workflows` and, laid out the same way, `.runthrough/workflows` (for workflows meant only for local runs); `-W` reads a single file or directory instead.
 

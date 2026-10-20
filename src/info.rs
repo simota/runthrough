@@ -135,17 +135,24 @@ pub fn bug_report(engine: &Engine, cache: &Path) -> String {
 }
 
 /// The pre-push hook: rehearse the commit being pushed, and block the push
-/// when a job fails or runthrough cannot run, saying how to push anyway.
+/// when a job fails, runthrough cannot run, or a ref other than HEAD is
+/// pushed (only HEAD is rehearsed), saying how to push anyway.
 const PRE_PUSH: &str = r#"#!/bin/sh
 # Installed by `runthrough --install-hook`: every `git push` first runs the
 # workflows its `push` triggers, on the HEAD commit. Add flags (e.g. --host)
 # to the runthrough line below; skip the hook once with `git push --no-verify`.
 head=$(git rev-parse HEAD 2>/dev/null)
+others=
 while read -r local_ref local_sha remote_ref remote_sha; do
-  if [ "$local_sha" != "$head" ] && [ "$local_sha" != 0000000000000000000000000000000000000000 ]; then
-    echo "runthrough: rehearsing HEAD ($head); $local_ref is not checked out and is not rehearsed" >&2
+  # Deleting a remote ref pushes no commit.
+  if [ "$local_sha" != "$head" ] && [ -n "$(echo "$local_sha" | tr -d 0)" ]; then
+    others="$others $local_ref"
   fi
 done
+if [ -n "$others" ]; then
+  echo "runthrough: only HEAD ($head) is rehearsed, so pushing$others was stopped; check it out and push again (push anyway: git push --no-verify)" >&2
+  exit 1
+fi
 runthrough --committed --quiet push
 status=$?
 if [ "$status" -eq 1 ]; then
@@ -271,6 +278,81 @@ mod tests {
                 0o111
             );
         }
+        // Only HEAD is rehearsed: pushing another commit is stopped before
+        // runthrough runs; deleting a remote ref pushes nothing.
+        let git = |args: &[&str]| {
+            assert!(Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&["commit", "--quiet", "--allow-empty", "-m", "a"]);
+        git(&["commit", "--quiet", "--allow-empty", "-m", "b"]);
+        let rev = |r: &str| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(["rev-parse", r])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let bin = tempfile::tempdir().unwrap();
+        let fake = bin.path().join("runthrough");
+        std::fs::write(&fake, "#!/bin/sh\necho rehearsed\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let push = |line: String| {
+            use std::io::Write;
+            let path = format!(
+                "{}:{}",
+                bin.path().display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            let mut child = Command::new("sh")
+                .arg(&hook)
+                .current_dir(repo.path())
+                .env("PATH", path)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(line.as_bytes())
+                .unwrap();
+            let out = child.wait_with_output().unwrap();
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned()
+                    + &String::from_utf8_lossy(&out.stderr),
+            )
+        };
+        let zero = "0".repeat(40);
+        let (head, older) = (rev("HEAD"), rev("HEAD~1"));
+        let (code, out) = push(format!("refs/heads/main {head} refs/heads/main {zero}\n"));
+        assert_eq!((code, out.trim()), (Some(0), "rehearsed"));
+        let (code, out) = push(format!(
+            "refs/heads/main {head} refs/heads/main {zero}\nHEAD~1 {older} refs/heads/old {zero}\n"
+        ));
+        assert_eq!(code, Some(1), "{out}");
+        assert!(
+            out.contains("pushing HEAD~1 was stopped") && !out.contains("rehearsed\n"),
+            "{out}"
+        );
+        let (code, out) = push(format!("(delete) {zero} refs/heads/old {older}\n"));
+        assert_eq!((code, out.trim()), (Some(0), "rehearsed"));
+
         std::fs::write(&hook, "mine").unwrap();
         let err = install_hook(repo.path()).unwrap_err().to_string();
         assert!(err.contains("already exists"), "{err}");
