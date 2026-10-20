@@ -6,11 +6,13 @@
 
 use anyhow::{bail, Context, Result};
 use indexmap::IndexMap;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
@@ -143,6 +145,13 @@ impl Engine {
     ) -> Result<()> {
         self.ensure_running()?;
         let program = self.program();
+        // One pull per image and platform per process (a `--watch` session too):
+        // jobs sharing an image wait for the first pull instead of repeating it.
+        static PULLS: LazyLock<Mutex<HashMap<String, Arc<Mutex<bool>>>>> =
+            LazyLock::new(Default::default);
+        let key = format!("{image}\0{}", platform.unwrap_or_default());
+        let once = PULLS.lock().unwrap().entry(key).or_default().clone();
+        let mut pulled = once.lock().unwrap();
         let exists = self
             .command()
             .args(["image", "inspect", image])
@@ -151,7 +160,7 @@ impl Engine {
             .status()
             .with_context(|| format!("running `{program}` (is it installed and on PATH?)"))?
             .success();
-        if pull || !exists {
+        if (pull && !*pulled) || !exists {
             eprintln!("  🐳 {program} image pull {image}");
             let mut cmd = self.command();
             // Logged in with a throwaway config so the user's own stays untouched.
@@ -168,9 +177,23 @@ impl Engine {
             if let Some(p) = platform {
                 cmd.args(["--platform", p]);
             }
-            let st = cmd.arg(image).stdout(Stdio::null()).status()?;
-            if !st.success() && !exists {
-                bail!("{program} image pull {image} failed");
+            let out = cmd
+                .arg(image)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()?;
+            *pulled = true;
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                let err = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                if !exists {
+                    bail!("{program} image pull {image} failed: {}", err.trim());
+                }
+                // A locally built image has nothing to pull from.
+                eprintln!(
+                    "  🐳 using the local {image}; the pull failed: {}",
+                    err.trim()
+                );
             }
         }
         Ok(())
