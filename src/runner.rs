@@ -44,8 +44,10 @@ pub struct Config {
     pub copy_mode: bool,
     pub bind: bool,
     pub use_gitignore: bool,
-    /// Check out the HEAD commit instead of copying the working tree.
-    pub committed: bool,
+    /// `--committed`: the HEAD commit's files (`actions::export_head`).
+    /// Checkouts take the HEAD commit instead of the working tree, and
+    /// workflows the repository calls are read from here.
+    pub committed: Option<PathBuf>,
     /// Emulate actions/checkout by copying the local repository.
     pub skip_checkout: bool,
     pub pull: bool,
@@ -1407,7 +1409,7 @@ fn run_reusable(
         chain.push(canonical(&wf.path));
         check_call_chain(&chain, &canonical(&path))?;
         log.line(&format!("📞 calling {uses}"));
-        let called = Workflow::load(&path)?;
+        let called = Workflow::load_as(&committed_source(cfg, &path), &path)?;
         check_call_args(&called, job, &uses)?;
 
         let mut inputs = Map::new();
@@ -1585,6 +1587,15 @@ fn repository_dir(cfg: &Config, owner: &str, repo: &str, git_ref: &str) -> Resul
             git_ref,
             cfg.offline,
         ),
+    }
+}
+
+/// Where to read the file at `path`: with `--committed`, a file of the
+/// repository comes from its HEAD commit, so the rehearsal runs what is pushed.
+fn committed_source(cfg: &Config, path: &Path) -> PathBuf {
+    match (&cfg.committed, path.strip_prefix(&cfg.repo.root)) {
+        (Some(head), Ok(rel)) => head.join(rel),
+        _ => path.to_path_buf(),
     }
 }
 
@@ -3865,7 +3876,7 @@ impl<'a> JobRun<'a> {
             &self.cfg.repo.root,
             &dest,
             self.cfg.use_gitignore,
-            self.cfg.committed,
+            self.cfg.committed.is_some(),
             &self.cfg.objects,
         )?;
         // As in GitHub's checkout of a pushed branch, `origin/<branch>` is the
@@ -3890,7 +3901,7 @@ impl<'a> JobRun<'a> {
         }
         open_to_all(&dest);
         let root = self.cfg.repo.root.display();
-        if self.cfg.committed {
+        if self.cfg.committed.is_some() {
             // The commit checked out, which an event payload's `after` may not be.
             let head = std::process::Command::new("git")
                 .arg("-C")

@@ -175,9 +175,11 @@ impl Step {
 }
 
 impl Workflow {
-    pub fn load(path: &Path) -> Result<Workflow> {
-        let text =
-            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    /// Load the workflow in `source` as the file at `path` (`--committed`
+    /// reads a repository's workflows from a copy of its HEAD commit).
+    pub fn load_as(source: &Path, path: &Path) -> Result<Workflow> {
+        let text = std::fs::read_to_string(source)
+            .with_context(|| format!("reading {}", path.display()))?;
         let doc: Yaml =
             serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         let errors = schema_errors(&doc);
