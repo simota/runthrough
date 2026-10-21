@@ -621,6 +621,12 @@ fn run(cli: &Cli) -> Result<Outcome> {
         .directory
         .canonicalize()
         .with_context(|| format!("{}", cli.directory.display()))?;
+    // Job directories are bind-mounted, so they must live where the engine sees them.
+    if !cli.host && cli.engine.has_private_tmp() {
+        let tmp = cache_base().join("tmp");
+        std::fs::create_dir_all(&tmp).with_context(|| format!("{}", tmp.display()))?;
+        let _ = tempfile::env::override_temp_dir(&tmp);
+    }
     let head = cli
         .committed
         .then(|| actions::export_head(&root))

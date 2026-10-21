@@ -326,6 +326,16 @@ impl Engine {
         self == Engine::Docker && engine_is_remote()
     }
 
+    /// Whether the engine has its own `/tmp`, so host temp directories bind-mount
+    /// empty: Ubuntu's Docker snap, whose confinement gives the daemon and the
+    /// client a private `/tmp` (but lets them see the home directory).
+    pub fn has_private_tmp(self) -> bool {
+        self == Engine::Docker
+            && cfg!(target_os = "linux")
+            && !engine_is_remote()
+            && Path::new("/snap/docker/current").exists()
+    }
+
     pub fn volume_create(self, name: &str) -> Result<()> {
         self.run(&["volume", "create", name]).map(|_| ())
     }
