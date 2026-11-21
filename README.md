@@ -70,7 +70,7 @@ Every run is recorded (with secrets masked) under `~/.cache/runthrough/runs`, an
 - `run` steps with `bash`, `sh`, `python`, `pwsh`, `node`, or custom `{0}` shells
 - `uses`: local and remote (`owner/repo[/path]@ref`) **composite**, **node** and **docker** actions, including `pre`/`post`, and `docker://image` steps; `--local-repository owner/repo@ref=PATH` substitutes a local folder
 - `actions/checkout` is emulated by copying the local repo (`--bind` mounts it instead, `--no-skip-checkout` runs the real action); other repositories are cloned
-- A cache server for `actions/cache` (on by default; it also serves BuildKit's `type=gha` cache for `docker/build-push-action`) and, with `--artifact-server-path`, an artifact server for `upload-artifact` / `download-artifact` v3 and v4 (it only answers the run's own jobs, which carry its `ACTIONS_RUNTIME_TOKEN`)
+- A cache server for `actions/cache` (on by default; it serves the v1 API through `ACTIONS_CACHE_URL` and the v2 API through `ACTIONS_CACHE_SERVICE_V2` and `ACTIONS_RESULTS_URL`, both over one store, and `cache-mode` applies to both; v2 calls need the run's `ACTIONS_RUNTIME_TOKEN`; it also serves BuildKit's `type=gha` cache for `docker/build-push-action`, which is only confirmed over v1; a `--github-instance` that is not github.com stays on v1, and `--cache-server-external-url` is used by its origin only for v2) and, with `--artifact-server-path`, an artifact server for `upload-artifact` / `download-artifact` v3 and v4 (it only answers the run's own jobs, which carry its `ACTIONS_RUNTIME_TOKEN`)
 - `GITHUB_OUTPUT`, `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_STATE`, `GITHUB_STEP_SUMMARY`, and `::set-output`, `::add-mask::`, `::group::`, `::error::`… commands, and problem matchers (`::add-matcher::`, `::remove-matcher::`); secrets are masked
 - `workflow_dispatch` inputs are checked before a run: `required`, `choice` `options`, `boolean` / `number` values
 
@@ -78,7 +78,7 @@ Steps see `RUNTHROUGH=true` and `ACT=true` (also in the `env` context, so workfl
 
 ## Not supported
 
-A job using one of these logs a note (`ℹ️`) when it starts. The cache service v2 API (`ACTIONS_CACHE_SERVICE_V2`). `permissions` and `jobs.<id>.snapshot` are validated but have no local effect; `environment` is reported (name and `url`) without environment secrets or protection rules. `concurrency` groups span one `runthrough` invocation, and a job cancelled by `cancel-in-progress` stops before its next step.
+A job using one of these logs a note (`ℹ️`) when it starts. `permissions` and `jobs.<id>.snapshot` are validated but have no local effect; `environment` is reported (name and `url`) without environment secrets or protection rules. `concurrency` groups span one `runthrough` invocation, and a job cancelled by `cancel-in-progress` stops before its next step.
 
 ## Platforms
 
