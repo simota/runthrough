@@ -865,11 +865,22 @@ fn real_actions_cache_v4_saves_and_restores_through_v2() {
         .args(["-C", FIXTURE, "--host", "registry_package"])
         .arg("--cache-server-path")
         .arg(dir.path())
+        // Only what runthrough injects may decide the cache API version.
+        .env("GITHUB_SERVER_URL", "https://github.com")
+        .env_remove("ACTIONS_CACHE_SERVICE_V2")
+        .env_remove("ACTIONS_RESULTS_URL")
+        .env_remove("ACTIONS_CACHE_URL")
+        .env_remove("ACTIONS_RUNTIME_TOKEN")
         .output()
         .unwrap();
+    let (status, stderr) = (
+        out.status,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    );
     let out = String::from_utf8_lossy(&out.stdout);
-    assert!(out.contains("cache v2 restored: v2 roundtrip"), "{out}");
-    assert!(out.contains("cache-v2 / v2-restore: success"), "{out}");
+    let diag = format!("status: {status}\nstdout:\n{out}\nstderr:\n{stderr}");
+    assert!(out.contains("cache v2 restored: v2 roundtrip"), "{diag}");
+    assert!(out.contains("cache-v2 / v2-restore: success"), "{diag}");
     let index: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("index.json")).unwrap()).unwrap();
     assert!(
