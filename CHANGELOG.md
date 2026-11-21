@@ -6,7 +6,7 @@ Each release's section is published as its GitHub release notes (see [RUNBOOK.md
 
 ### Added
 
-- The cache server answers the cache service v2 API (`ACTIONS_CACHE_SERVICE_V2`) used by `actions/cache@v4`, sharing entries with the v1 API. While the cache server runs, jobs get `ACTIONS_CACHE_SERVICE_V2` (except non-`write` `cache-mode` jobs when runthrough's own environment sets `ACTIONS_RUNTIME_TOKEN`) and, without `--artifact-server-path`, an `ACTIONS_RESULTS_URL` pointing at the cache server.
+- The cache server serves the cache service v2 API used by `actions/cache@v4`, on by default for jobs (`ACTIONS_CACHE_SERVICE_V2=true`), from the same store as the v1 API. BuildKit's `type=gha` cache (`docker/build-push-action`) goes through v2 as well; that path is built from its client's source and not yet confirmed with a real BuildKit run. A job-level `env: ACTIONS_CACHE_SERVICE_V2: ""` keeps that job on v1.
 
 ## 0.3.0
 

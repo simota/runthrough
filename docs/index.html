@@ -347,7 +347,7 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
       <article>
         <h3>Props backstage</h3>
         <ul>
-          <li>A built-in cache server for <code>actions/cache</code> (v1 and v2 APIs) and BuildKit's <code>type=gha</code> cache</li>
+          <li>A built-in cache server for <code>actions/cache</code> (v1 and v2 APIs), which BuildKit's <code>type=gha</code> cache also uses through v2 (not yet confirmed with a real BuildKit run)</li>
           <li>An artifact server for <code>upload-artifact</code> / <code>download-artifact</code> v3 and v4</li>
           <li>Service containers on a per-job network, reachable by name</li>
           <li><code>setup-*</code> tools download once into a shared tool cache</li>
