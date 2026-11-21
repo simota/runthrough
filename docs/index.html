@@ -347,7 +347,7 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
       <article>
         <h3>Props backstage</h3>
         <ul>
-          <li>A built-in cache server for <code>actions/cache</code> and BuildKit's <code>type=gha</code> cache</li>
+          <li>A built-in cache server for <code>actions/cache</code> (v1 and v2 APIs), which BuildKit's <code>type=gha</code> cache also uses through v2 (not yet confirmed with a real BuildKit run)</li>
           <li>An artifact server for <code>upload-artifact</code> / <code>download-artifact</code> v3 and v4</li>
           <li>Service containers on a per-job network, reachable by name</li>
           <li><code>setup-*</code> tools download once into a shared tool cache</li>
@@ -435,7 +435,6 @@ section { padding-block: clamp(3.5rem, 8vw, 6rem); border-top: 1px solid var(--l
       <p>A local rehearsal can't do everything the real stage does. These are the known gaps, and a run says so when a job uses one of them.</p>
     </div>
     <div class="gaps">
-      <div><strong>Cache service v2</strong>The <code>ACTIONS_CACHE_SERVICE_V2</code> API is not served. The v1 API is.</div>
       <div><strong>Permissions</strong><code>permissions</code> is validated but has no local effect.</div>
       <div><strong>Environments</strong>The name and <code>url</code> are reported. Environment secrets and protection rules are not applied.</div>
       <div><strong>Concurrency</strong>Groups span a single <code>runthrough</code> invocation. A cancelled job stops before its next step.</div>
