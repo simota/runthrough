@@ -1,0 +1,25 @@
+name: cache-v2
+on: registry_package
+jobs:
+  v2-save:
+    runs-on: ubuntu-latest
+    env:
+      ACTIONS_CACHE_URL: ""   # only the v2 API can serve this job
+    steps:
+      - run: test -n "$ACTIONS_CACHE_SERVICE_V2" && test -z "$ACTIONS_CACHE_URL"
+      - run: mkdir -p v2-cache && echo "v2 roundtrip" > v2-cache/data.txt
+      - uses: actions/cache@v4
+        with: { path: v2-cache, key: v2-roundtrip }
+  v2-restore:
+    needs: v2-save
+    runs-on: ubuntu-latest
+    env:
+      ACTIONS_CACHE_URL: ""
+    steps:
+      - run: rm -rf v2-cache   # a shared workspace (--bind) must not leak the saved file
+      - uses: actions/cache/restore@v4
+        with: { path: v2-cache, key: v2-roundtrip, fail-on-cache-miss: true }
+      - run: |
+          printf '%s\n' 'v2 roundtrip' | cmp - v2-cache/data.txt
+      - run: |
+          echo "cache v2 restored: $(cat v2-cache/data.txt)"

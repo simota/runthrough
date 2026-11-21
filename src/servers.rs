@@ -44,7 +44,17 @@ pub struct Response {
     /// `Content-Encoding`, for gzipped v3 artifact files.
     pub encoding: Option<&'static str>,
     /// Sent after the headers instead of `body`, without reading it into memory.
-    pub file: Option<std::fs::File>,
+    pub file: Option<FileBody>,
+}
+
+/// A file a response sends: all of it, or a byte range of a cache v2 download.
+pub struct FileBody {
+    file: std::fs::File,
+    /// `(offset, length)`: the answer is a 206 with `Content-Range`.
+    range: Option<(u64, u64)>,
+    /// The answer to a `HEAD`: the headers alone, with the `Content-Length`
+    /// the body would have.
+    head: bool,
 }
 
 impl Response {
@@ -76,7 +86,11 @@ impl Response {
                 content_type,
                 body: vec![],
                 encoding,
-                file: Some(f),
+                file: Some(FileBody {
+                    file: f,
+                    range: None,
+                    head: false,
+                }),
             },
             Err(_) => Response::empty(404),
         }
@@ -185,16 +199,30 @@ fn write_response(stream: &mut impl Write, r: &Response) -> std::io::Result<()> 
         200 => "OK",
         201 => "Created",
         204 => "No Content",
+        206 => "Partial Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
         409 => "Conflict",
+        416 => "Range Not Satisfiable",
         _ => "Error",
     };
     let body: &[u8] = if r.status == 204 { &[] } else { &r.body };
-    let len = match &r.file {
-        Some(f) => f.metadata()?.len(),
-        None => body.len() as u64,
+    let (len, range) = match &r.file {
+        Some(FileBody {
+            file,
+            range: Some((offset, n)),
+            ..
+        }) => {
+            let size = file.metadata()?.len();
+            let last = (offset + n).saturating_sub(1);
+            (
+                *n,
+                format!("Content-Range: bytes {offset}-{last}/{size}\r\n"),
+            )
+        }
+        Some(f) => (f.file.metadata()?.len(), String::new()),
+        None => (body.len() as u64, String::new()),
     };
     let encoding = r
         .encoding
@@ -202,14 +230,24 @@ fn write_response(stream: &mut impl Write, r: &Response) -> std::io::Result<()> 
         .unwrap_or_default();
     write!(
         stream,
-        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{encoding}Cache-Control: no-store\r\nETag: \"0x1\"\r\nLast-Modified: Thu, 01 Jan 2026 00:00:00 GMT\r\nx-ms-request-id: runthrough\r\nx-ms-version: 2024-11-04\r\n\r\n",
+        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{encoding}{range}Cache-Control: no-store\r\nETag: \"0x1\"\r\nLast-Modified: Thu, 01 Jan 2026 00:00:00 GMT\r\nx-ms-request-id: runthrough\r\nx-ms-version: 2024-11-04\r\n\r\n",
         r.status,
         r.content_type,
         len
     )?;
     match &r.file {
+        Some(FileBody { head: true, .. }) => {}
+        Some(FileBody {
+            file,
+            range: Some((offset, n)),
+            ..
+        }) => {
+            let mut file = file;
+            file.seek(SeekFrom::Start(*offset))?;
+            std::io::copy(&mut file.take(*n), stream)?;
+        }
         Some(f) => {
-            std::io::copy(&mut &*f, stream)?;
+            std::io::copy(&mut &f.file, stream)?;
         }
         None => stream.write_all(body)?,
     }
@@ -753,10 +791,16 @@ fn cache_v2_twirp(v2: &CacheV2, method: &str, req: &Request, origin: &str) -> Re
                 .reserve(&key, version, Some(&owner))
             else {
                 // Non-retryable: logged as "another job may be creating this cache".
-                return twirp_error(
+                // go-actions-cache (BuildKit's `type=gha`) takes it for
+                // `os.ErrExist`, and saves under the next index key, only when
+                // its error type contains `AlreadyExists` (mapped from the
+                // code) or its `message` says "already exists": `message`
+                // repeats the Twirp `msg`.
+                let msg =
+                    "a cache entry with this key and version already exists or is being uploaded";
+                return Response::json(
                     409,
-                    "already_exists",
-                    "a cache entry with this key and version exists or is being uploaded",
+                    json!({"code": "already_exists", "msg": msg, "message": msg}),
                 );
             };
             Response::json(
@@ -872,14 +916,14 @@ impl CacheV2 {
 }
 
 /// Uploads (Put Blob, or Put Block and Put Block List) to a pending entry and
-/// plain downloads of a complete one, at the URLs `cache_v2_twirp` signs. The
-/// signature alone authorizes them: only calls the job's cache-mode allows
-/// hand them out.
+/// downloads (`GET`, whole or a byte range, and `HEAD`) of a complete one, at
+/// the URLs `cache_v2_twirp` signs. The signature alone authorizes them: only
+/// calls the job's cache-mode allows hand them out.
 fn cache_v2_blob(v2: &CacheV2, req: &Request) -> Response {
     let parts: Vec<&str> = req.path.trim_start_matches('/').split('/').collect();
     let (upload, id) = match (req.method.as_str(), parts.as_slice()) {
         ("PUT", ["cache-v2", "upload", id]) => (true, id),
-        ("GET", ["cache-v2", "download", id]) => (false, id),
+        ("GET" | "HEAD", ["cache-v2", "download", id]) => (false, id),
         _ => return Response::empty(404),
     };
     let Ok(id) = id.parse::<u64>() else {
@@ -906,7 +950,7 @@ fn cache_v2_blob(v2: &CacheV2, req: &Request) -> Response {
     // Other jobs' cache calls go on while blob data is copied.
     drop(store);
     if !upload {
-        return Response::file(&blob, "application/octet-stream", None);
+        return cache_v2_download(&blob, req);
     }
     match stage_block_blob(req, &blocks, &staging) {
         Ok(staged) => {
@@ -915,6 +959,65 @@ fn cache_v2_blob(v2: &CacheV2, req: &Request) -> Response {
         }
         Err(_) => Response::empty(400),
     }
+}
+
+/// A complete entry's `blob`: all of it (the toolkit), or the byte range the
+/// request asks for, which the Azure Go SDK does to resume a read (BuildKit);
+/// a `HEAD` gets the headers alone.
+fn cache_v2_download(blob: &Path, req: &Request) -> Response {
+    let mut resp = Response::file(blob, "application/octet-stream", None);
+    let Some(body) = resp.file.as_mut() else {
+        return resp;
+    };
+    let Ok(size) = body.file.metadata().map(|m| m.len()) else {
+        return Response::empty(404);
+    };
+    let Ok(range) = byte_range(req, size) else {
+        return Response::empty(416);
+    };
+    body.range = range;
+    body.head = req.method == "HEAD";
+    if range.is_some() {
+        resp.status = 206;
+    }
+    resp
+}
+
+/// The byte range a download asks for in `x-ms-range` (Azure's, which wins)
+/// or `Range`, as `(offset, length)` within `size` bytes: `bytes=N-` or
+/// `bytes=N-M` (`M` past the end means the end). `Ok(None)` for the whole
+/// blob: no range, or one of another form, which HTTP lets a server ignore;
+/// `Err` when it starts at or beyond the end.
+fn byte_range(req: &Request, size: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(spec) = req
+        .headers
+        .get("x-ms-range")
+        .or_else(|| req.headers.get("range"))
+    else {
+        return Ok(None);
+    };
+    let Some((start, end)) = spec
+        .trim()
+        .strip_prefix("bytes=")
+        .and_then(|r| r.split_once('-'))
+    else {
+        return Ok(None);
+    };
+    let Ok(start) = start.trim().parse::<u64>() else {
+        return Ok(None);
+    };
+    let end = match end.trim() {
+        "" => None,
+        end => match end.parse::<u64>() {
+            Ok(end) if end >= start => Some(end),
+            _ => return Ok(None),
+        },
+    };
+    if start >= size {
+        return Err(());
+    }
+    let last = end.map_or(size - 1, |e| e.min(size - 1));
+    Ok(Some((start, last - start + 1)))
 }
 
 // ------------------------------------------------------------------ artifacts (v4 API)
@@ -2481,7 +2584,7 @@ mod tests {
             (status, again),
             (
                 409,
-                json!({"code": "already_exists", "msg": "a cache entry with this key and version exists or is being uploaded"})
+                json!({"code": "already_exists", "msg": "a cache entry with this key and version already exists or is being uploaded", "message": "a cache entry with this key and version already exists or is being uploaded"})
             )
         );
         let (status, unknown) = v2_twirp(&h, Some(&token), "DeleteCacheEntry", json!({}));
@@ -3024,7 +3127,7 @@ mod tests {
         let h = |req| cache_server(&v2, "tok", req);
         let conflict = (
             409,
-            json!({"code": "already_exists", "msg": "a cache entry with this key and version exists or is being uploaded"}),
+            json!({"code": "already_exists", "msg": "a cache entry with this key and version already exists or is being uploaded", "message": "a cache entry with this key and version already exists or is being uploaded"}),
         );
         let create = |token: &str, key: &str| {
             v2_twirp(
@@ -3664,6 +3767,12 @@ mod tests {
             v2_restore(&with, &token, "k", &[]).unwrap().1,
             b"through the artifact port"
         );
+        let (_, url) = v2_download_url(&with, &token, "k", &[]);
+        let ranged = with(url_req("GET", &url, "", &[("x-ms-range", "bytes=8-")], b""));
+        assert_eq!(
+            (ranged.status, on_wire(&ranged).1),
+            (206, b"the artifact port".to_vec())
+        );
         // Its own API is still there.
         let (status, _) = {
             let r = with(Request {
@@ -3704,5 +3813,280 @@ mod tests {
             serde_json::from_slice::<Value>(&r.body).unwrap(),
             json!({"code": "bad_route", "msg": "the artifact server is off: run with --artifact-server-path"})
         );
+    }
+
+    // ------------------------------------------------ cache v2, BuildKit's client
+
+    /// GetCacheEntryDownloadURL that hits: the matched key and the signed URL.
+    fn v2_download_url(
+        h: &dyn Fn(Request) -> Response,
+        token: &str,
+        key: &str,
+        restore_keys: &[&str],
+    ) -> (String, String) {
+        let (status, found) = v2_twirp(
+            h,
+            Some(token),
+            "GetCacheEntryDownloadURL",
+            json!({"key": key, "restore_keys": restore_keys, "version": "v"}),
+        );
+        assert_eq!((status, &found["ok"]), (200, &json!(true)), "{found}");
+        (
+            found["matched_key"].as_str().unwrap().to_string(),
+            found["signed_download_url"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// How go-actions-cache tells "already exists" (`os.ErrExist`) from a
+    /// non-2xx body: an error type containing `AlreadyExists`, which it maps
+    /// from the code `already_exists`, or a `message` saying so.
+    fn go_already_exists_by_code(body: &Value) -> bool {
+        body["code"] == "already_exists"
+    }
+
+    fn go_already_exists_by_message(body: &Value) -> bool {
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.to_lowercase().contains("already exists"))
+    }
+
+    /// The Azure Go SDK resumes a read with `x-ms-range: bytes=<offset>-`;
+    /// `Range` works the same, `x-ms-range` wins, and no range (the toolkit)
+    /// is the whole blob as before.
+    #[test]
+    fn cache_v2_downloads_serve_byte_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        v2_save(&h, &token, "ranged", b"0123456789");
+        let (_, url) = v2_download_url(&h, &token, "ranged", &[]);
+        let get = |headers: &[(&str, &str)]| {
+            let resp = h(url_req("GET", &url, "", headers, b""));
+            let (head, body) = on_wire(&resp);
+            (resp.status, head, body)
+        };
+        for (headers, range, data) in [
+            (&[("x-ms-range", "bytes=4-")][..], "4-9/10", &b"456789"[..]),
+            (&[("range", "bytes=4-")][..], "4-9/10", b"456789"),
+            (&[("range", "bytes=2-5")][..], "2-5/10", b"2345"),
+            (&[("x-ms-range", "bytes=8-100")][..], "8-9/10", b"89"),
+            (&[("x-ms-range", "bytes=0-")][..], "0-9/10", b"0123456789"),
+            (
+                &[("x-ms-range", "bytes=1-1"), ("range", "bytes=5-")][..],
+                "1-1/10",
+                b"1",
+            ),
+        ] {
+            let (status, head, body) = get(headers);
+            assert_eq!(status, 206, "{headers:?}");
+            assert!(
+                head.starts_with("HTTP/1.1 206 Partial Content\r\n"),
+                "{head}"
+            );
+            assert!(
+                head.contains(&format!("Content-Range: bytes {range}\r\n")),
+                "{head}"
+            );
+            assert!(
+                head.contains(&format!("Content-Length: {}\r\n", data.len())),
+                "{head}"
+            );
+            assert_eq!(body, data, "{headers:?}");
+        }
+        for headers in [
+            &[("x-ms-range", "bytes=10-")][..],
+            &[("range", "bytes=11-12")],
+        ] {
+            let (status, head, body) = get(headers);
+            assert_eq!(status, 416, "{headers:?}");
+            assert!(
+                head.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"),
+                "{head}"
+            );
+            assert!(body.is_empty());
+        }
+        // No range, or one of another form: the whole blob, unchanged.
+        for headers in [&[][..], &[("range", "bytes=-3")], &[("range", "bytes=5-2")]] {
+            let (status, head, body) = get(headers);
+            assert_eq!(status, 200, "{headers:?}");
+            assert!(!head.contains("Content-Range"), "{head}");
+            assert!(head.contains("Content-Length: 10\r\n"), "{head}");
+            assert_eq!(body, b"0123456789");
+        }
+    }
+
+    #[test]
+    fn cache_v2_head_answers_the_headers_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        v2_save(&h, &token, "props", b"0123456789");
+        let (_, url) = v2_download_url(&h, &token, "props", &[]);
+        let resp = h(url_req("HEAD", &url, "", &[], b""));
+        assert_eq!(resp.status, 200);
+        let (head, body) = on_wire(&resp);
+        assert!(head.contains("Content-Length: 10\r\n"), "{head}");
+        assert!(head.contains("x-ms-request-id: "), "{head}");
+        assert!(body.is_empty());
+        // The signature still decides.
+        let unsigned = url.split_once('?').unwrap().0;
+        assert_eq!(h(url_req("HEAD", unsigned, "", &[], b"")).status, 401);
+    }
+
+    /// The Go SDK dereferences the request ID of every blob answer: without an
+    /// `x-ms-request-id` header BuildKit crashes.
+    #[test]
+    fn cache_v2_blob_answers_carry_a_request_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let has_id = |resp: &Response| on_wire(resp).0.contains("\r\nx-ms-request-id: ");
+        let url = v2_create(&h, &token, "blob");
+        let put = h(url_req(
+            "PUT",
+            &url,
+            "",
+            &[("x-ms-blob-type", "BlockBlob")],
+            b"x",
+        ));
+        assert_eq!(put.status, 201);
+        assert!(has_id(&put), "Put Blob");
+        let url = v2_create(&h, &token, "blocks");
+        let block = h(url_req("PUT", &url, "comp=block&blockid=AAAA", &[], b"y"));
+        assert_eq!(block.status, 201);
+        assert!(has_id(&block), "Put Block");
+        let list = h(url_req(
+            "PUT",
+            &url,
+            "comp=blocklist",
+            &[],
+            b"<BlockList><Latest>AAAA</Latest></BlockList>",
+        ));
+        assert_eq!(list.status, 201);
+        assert!(has_id(&list), "Put Block List");
+        assert_eq!(v2_finalize(&h, &token, "blocks", json!(1))["ok"], true);
+        let (_, url) = v2_download_url(&h, &token, "blocks", &[]);
+        for headers in [&[][..], &[("x-ms-range", "bytes=0-")]] {
+            let get = h(url_req("GET", &url, "", headers, b""));
+            assert!(get.status == 200 || get.status == 206);
+            assert!(has_id(&get), "download {headers:?}");
+        }
+    }
+
+    /// The 409 of a CreateCacheEntry is "already exists" for both clients:
+    /// the toolkit reads `code`/`msg`, go-actions-cache the code or `message`.
+    #[test]
+    fn cache_v2_conflicts_are_already_exists_for_go_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let key = "index-buildkit-1#0";
+        v2_save(&h, &token, key, b"x");
+        let (status, body) = v2_twirp(
+            &h,
+            Some(&token),
+            "CreateCacheEntry",
+            json!({"key": key, "version": "v"}),
+        );
+        assert_eq!(status, 409);
+        assert_eq!(fields(&body), ["code", "message", "msg"], "{body}");
+        assert_eq!(body["msg"], body["message"]);
+        assert!(go_already_exists_by_code(&body) && go_already_exists_by_message(&body));
+        assert!(!body.to_string().contains(key), "{body}");
+    }
+
+    /// What go-actions-cache sends: Create, Put Block ×2 with base64 IDs, the
+    /// Go SDK's block list (XML declaration, newline), Finalize with a numeric
+    /// `size_bytes`, Get repeating the key in `restore_keys`, then a read
+    /// resumed at an offset.
+    #[test]
+    fn cache_v2_serves_a_go_client_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let key = "buildkit-blob-1-sha256:abc";
+        let (status, created) = v2_twirp(
+            &h,
+            Some(&token),
+            "CreateCacheEntry",
+            json!({"key": key, "version": "v"}),
+        );
+        assert_eq!((status, &created["ok"]), (200, &json!(true)), "{created}");
+        let url = created["signed_upload_url"].as_str().unwrap();
+        // Query values as the server sees them, percent-decoded.
+        let ids = ["Yi8rAAAAAAAAAAAAAAAAAA==", "Yi8rAQAAAAAAAAAAAAAAAA=="];
+        for (id, data) in ids.iter().zip([b"layer ".as_slice(), b"bytes"]) {
+            let put = h(url_req(
+                "PUT",
+                url,
+                &format!("comp=block&blockid={id}"),
+                &[("x-ms-version", "2025-01-05")],
+                data,
+            ));
+            assert_eq!(put.status, 201);
+        }
+        let list = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<BlockList><Latest>{}</Latest><Latest>{}</Latest></BlockList>",
+            ids[0], ids[1]
+        );
+        let put = h(url_req(
+            "PUT",
+            url,
+            "comp=blocklist",
+            &[("content-type", "application/xml")],
+            list.as_bytes(),
+        ));
+        assert_eq!(put.status, 201);
+        let done = v2_finalize(&h, &token, key, json!(11));
+        assert_eq!(fields(&done), ["entry_id", "ok"], "{done}");
+        // A string, as proto3 JSON writes an int64.
+        assert!(done["ok"] == true && done["entry_id"].is_string(), "{done}");
+        let (matched, url) = v2_download_url(&h, &token, key, &[key]);
+        assert_eq!(matched, key);
+        let whole = h(url_req("GET", &url, "", &[], b""));
+        assert_eq!(
+            (whole.status, on_wire(&whole).1),
+            (200, b"layer bytes".to_vec())
+        );
+        let rest = h(url_req("GET", &url, "", &[("x-ms-range", "bytes=6-")], b""));
+        assert_eq!((rest.status, on_wire(&rest).1), (206, b"bytes".to_vec()));
+    }
+
+    /// BuildKit's SaveMutable: Load(`key#`) finds the newest index, a save of
+    /// an index that exists is "already exists", and the next one succeeds.
+    #[test]
+    fn cache_v2_save_mutable_finds_the_newest_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        v2_save(&h, &token, "index#1", b"first");
+        age(&v2, 1, 1);
+        v2_save(&h, &token, "index#2", b"second");
+        let (matched, url) = v2_download_url(&h, &token, "index#", &["index#"]);
+        assert_eq!(matched, "index#2");
+        assert_eq!(on_wire(&h(url_req("GET", &url, "", &[], b""))).1, b"second");
+        let (status, body) = v2_twirp(
+            &h,
+            Some(&token),
+            "CreateCacheEntry",
+            json!({"key": "index#2", "version": "v"}),
+        );
+        assert_eq!(status, 409);
+        assert!(go_already_exists_by_code(&body) && go_already_exists_by_message(&body));
+        v2_save(&h, &token, "index#3", b"third");
+        let (matched, _) = v2_download_url(&h, &token, "index#", &["index#"]);
+        assert_eq!(matched, "index#3");
     }
 }
