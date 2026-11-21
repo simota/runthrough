@@ -376,8 +376,8 @@ impl CacheStore {
     ///   version, and its data goes straight into the (empty) blob;
     /// - v2 (`owner` is the caller's token claims) refuses while another
     ///   reservation of them is still in use, replaces only an abandoned one,
-    ///   and also gets an empty staging file, which its finalize publishes
-    ///   over the blob.
+    ///   and gets no file: its uploads create the staging file, which its
+    ///   finalize publishes as the blob.
     ///
     /// A replaced entry's files go with it.
     fn reserve(&mut self, key: &str, version: &str, owner: Option<&str>) -> Option<u64> {
@@ -412,13 +412,21 @@ impl CacheStore {
             created: now,
             used: now,
         });
-        let _ = std::fs::write(self.blob(id), b"");
-        if let Some(owner) = owner {
-            let _ = std::fs::write(self.staging(id), b"");
-            self.owners.insert(id, owner.to_string());
+        match owner {
+            None => {
+                let _ = std::fs::write(self.blob(id), b"");
+            }
+            Some(owner) => {
+                self.owners.insert(id, owner.to_string());
+            }
         }
         self.save();
         Some(id)
+    }
+
+    /// Whether `id` is a pending v2 reservation, which the v1 routes leave alone.
+    fn reserved_by_v2(&self, id: u64) -> bool {
+        self.owners.contains_key(&id)
     }
 
     /// Mark the pending entry `id` complete; false when there is none.
@@ -492,7 +500,7 @@ fn cache_mode_segment(mode: CacheMode) -> String {
     }
 }
 
-fn cache_handler(store: Arc<Mutex<CacheStore>>, token: &str, req: Request) -> Response {
+fn cache_handler(shared: Arc<Mutex<CacheStore>>, token: &str, req: Request) -> Response {
     let Some(after_token) = req.path.strip_prefix(&format!("/{token}/")) else {
         return Response::empty(404);
     };
@@ -504,7 +512,7 @@ fn cache_handler(store: Arc<Mutex<CacheStore>>, token: &str, req: Request) -> Re
         return Response::empty(404);
     };
     let (restore, save) = (mode.can_restore(), mode.can_save());
-    let mut store = store.lock().unwrap();
+    let mut store = shared.lock().unwrap();
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
     match (
         req.method.as_str(),
@@ -563,8 +571,10 @@ fn cache_handler(store: Arc<Mutex<CacheStore>>, token: &str, req: Request) -> Re
             let Ok(id) = id.parse::<u64>() else {
                 return Response::empty(400);
             };
-            // Only a pending reservation takes data, not a committed entry.
-            if !store.entries.iter().any(|e| e.id == id && !e.complete) {
+            // Only a pending reservation of this API takes data, not a committed
+            // entry or a v2 upload.
+            if !store.entries.iter().any(|e| e.id == id && !e.complete) || store.reserved_by_v2(id)
+            {
                 return Response::empty(404);
             }
             // Other jobs' cache calls go on while this chunk is written.
@@ -586,7 +596,15 @@ fn cache_handler(store: Arc<Mutex<CacheStore>>, token: &str, req: Request) -> Re
                     f.write_all(&req.body)
                 });
             match written {
-                Ok(()) => Response::empty(204),
+                Ok(()) => {
+                    // An upload in progress is not abandoned, for `gc` or a v2
+                    // reservation of the same key.
+                    let mut store = shared.lock().unwrap();
+                    if let Some(e) = store.entries.iter_mut().find(|e| e.id == id && !e.complete) {
+                        e.used = now();
+                    }
+                    Response::empty(204)
+                }
                 Err(_) => Response::empty(404),
             }
         }
@@ -594,14 +612,16 @@ fn cache_handler(store: Arc<Mutex<CacheStore>>, token: &str, req: Request) -> Re
             let Ok(id) = id.parse::<u64>() else {
                 return Response::empty(400);
             };
-            if store.commit(id) {
+            if !store.reserved_by_v2(id) && store.commit(id) {
                 Response::empty(204)
             } else {
                 Response::empty(404)
             }
         }
-        ("GET", ["artifacts", id]) => match id.parse::<u64>().map(|id| store.blob(id)) {
-            Ok(p) => Response::file(&p, "application/octet-stream", None),
+        ("GET", ["artifacts", id]) => match id.parse::<u64>() {
+            // A v2 upload is not served before its finalize.
+            Ok(id) if store.reserved_by_v2(id) => Response::empty(404),
+            Ok(id) => Response::file(&store.blob(id), "application/octet-stream", None),
             Err(_) => Response::empty(400),
         },
         _ => Response::empty(404),
@@ -882,7 +902,10 @@ fn cache_v2_blob(v2: &CacheV2, req: &Request) -> Response {
         return Response::file(&blob, "application/octet-stream", None);
     }
     match stage_block_blob(req, &blocks, &staging) {
-        Ok(staged) => v2.place(id, staged),
+        Ok(staged) => {
+            after_stage();
+            v2.place(id, staged)
+        }
         Err(_) => Response::empty(400),
     }
 }
@@ -1032,43 +1055,43 @@ impl UrlSigner {
     }
 }
 
-/// An Azure-blob-style upload received into a temporary file beside the file it
-/// is for, so that a failed, repeated or late request never truncates what is
-/// there; `Staged::place` renames it into place.
+/// A cache v2 upload received into a temporary file beside its staging file,
+/// so that a failed, repeated or late request never truncates what is there;
+/// `CacheV2::place` renames it into place.
 enum Staged {
     /// Put Block (`comp=block`): the block, for `blocks/<hex(blockid)>`.
     Block(tempfile::NamedTempFile, String),
     /// Put Blob (no `comp`), or Put Block List (`comp=blocklist`) with the
-    /// listed blocks joined in order: the whole blob, and its size.
-    Blob(tempfile::NamedTempFile, u64),
+    /// listed blocks joined in order: the whole upload.
+    Blob(tempfile::NamedTempFile),
 }
 
 impl Staged {
-    /// Rename into place: a block under `blocks`, a blob over `file`. The
-    /// blob's size; `None` for a block.
-    fn place(self, blocks: &Path, file: &Path) -> Result<Option<u64>> {
+    /// Rename into place: a block under `blocks`, the whole upload over `staging`.
+    fn place(self, blocks: &Path, staging: &Path) -> Result<()> {
         match self {
             Staged::Block(tmp, name) => {
                 std::fs::create_dir_all(blocks)?;
                 tmp.persist(blocks.join(name))?;
-                Ok(None)
             }
-            Staged::Blob(tmp, size) => {
-                tmp.persist(file)?;
-                Ok(Some(size))
+            Staged::Blob(tmp) => {
+                tmp.persist(staging)?;
             }
         }
+        Ok(())
     }
 }
 
-/// Receive an Azure-blob-style upload of `req` for `file` (blocks under
-/// `blocks`) into a temporary file in `file`'s directory. A block list reads
-/// the blocks and leaves them, so the same list sent again (a retry whose
-/// first answer got lost) joins the same blob; whoever owns the upload removes
-/// `blocks` when it is finalized.
-fn stage_block_blob(req: &Request, blocks: &Path, file: &Path) -> Result<Staged> {
-    let dir = file.parent().context("upload path without a directory")?;
-    std::fs::create_dir_all(dir)?;
+/// Receive a cache v2 upload of `req` for `staging` (blocks under `blocks`)
+/// into a temporary file in `staging`'s directory. A block list reads the
+/// blocks and leaves them, so the same list sent again (a retry whose first
+/// answer got lost) joins the same upload; the finalize removes them. A block
+/// list that does not parse, or a `comp` this server does not know, is an
+/// error.
+fn stage_block_blob(req: &Request, blocks: &Path, staging: &Path) -> Result<Staged> {
+    let dir = staging
+        .parent()
+        .context("staging path without a directory")?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     Ok(match req.query.get("comp").map(String::as_str) {
         Some("block") => {
@@ -1077,33 +1100,72 @@ fn stage_block_blob(req: &Request, blocks: &Path, file: &Path) -> Result<Staged>
             Staged::Block(tmp, hex::encode(block))
         }
         Some("blocklist") => {
-            let xml = String::from_utf8_lossy(&req.body);
-            let mut size = 0u64;
-            for chunk in xml.split('>').skip(1) {
-                let Some((block, _)) = chunk.split_once('<') else {
-                    continue;
-                };
-                let block = block.trim();
-                if block.is_empty() {
-                    continue;
-                }
-                let mut data = std::fs::File::open(blocks.join(hex::encode(block)))?;
-                size += std::io::copy(&mut data, tmp.as_file_mut())?;
+            let ids = block_list(&req.body).context("not a block list")?;
+            for id in ids {
+                let mut data = std::fs::File::open(blocks.join(hex::encode(id)))?;
+                std::io::copy(&mut data, tmp.as_file_mut())?;
             }
-            Staged::Blob(tmp, size)
+            Staged::Blob(tmp)
         }
-        _ => {
+        None => {
             tmp.write_all(&req.body)?;
-            Staged::Blob(tmp, req.body.len() as u64)
+            Staged::Blob(tmp)
         }
+        Some(comp) => bail!("unsupported comp={comp}"),
     })
 }
 
-/// An Azure-blob-style upload of `req` to `file`, staged and then put in
-/// place at once (see `stage_block_blob`). Returns the size of `file` when it
-/// was written.
-fn write_block_blob(req: &Request, blocks: &Path, file: &Path) -> Result<Option<u64>> {
-    stage_block_blob(req, blocks, file)?.place(blocks, file)
+/// The block IDs of a Put Block List body, in order:
+/// `<?xml …?><BlockList><Latest>id</Latest>…</BlockList>`, where `Committed`
+/// and `Uncommitted` name blocks as `Latest` does. `None` when it is not one.
+fn block_list(body: &[u8]) -> Option<Vec<String>> {
+    let xml = std::str::from_utf8(body).ok()?.trim();
+    let xml = match xml.strip_prefix("<?xml") {
+        Some(rest) => rest.split_once("?>")?.1,
+        None => xml,
+    };
+    let mut rest = xml
+        .trim_start()
+        .strip_prefix("<BlockList>")?
+        .strip_suffix("</BlockList>")?;
+    let mut ids = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return Some(ids);
+        }
+        let (tag, after) = rest.strip_prefix('<')?.split_once('>')?;
+        if !["Latest", "Committed", "Uncommitted"].contains(&tag) {
+            return None;
+        }
+        let (id, after) = after.split_once('<')?;
+        rest = after
+            .strip_prefix('/')?
+            .strip_prefix(tag)?
+            .strip_prefix('>')?;
+        let id = id.trim();
+        if id.is_empty() {
+            return None;
+        }
+        ids.push(id.to_string());
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Run once by `after_stage`: a test's finalize or `gc` between a PUT's
+    /// pending check and its placing.
+    static AFTER_STAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Where a cache v2 PUT has staged its data but not yet placed it; a test can
+/// interleave other calls here.
+fn after_stage() {
+    #[cfg(test)]
+    if let Some(f) = AFTER_STAGE.with(|h| h.borrow_mut().take()) {
+        f();
+    }
 }
 
 impl ArtifactStore {
@@ -1376,10 +1438,7 @@ fn twirp(store: &mut ArtifactStore, method: &str, req: &Request, host: &str) -> 
                     if size > 0 {
                         a.size = size;
                     }
-                    let id = a.id;
-                    // A block list leaves its blocks for a retry of it.
-                    let _ = std::fs::remove_dir_all(store.blocks_dir(id));
-                    Response::json(200, json!({"ok": true, "artifactId": id.to_string()}))
+                    Response::json(200, json!({"ok": true, "artifactId": a.id.to_string()}))
                 }
                 None => twirp_error(404, "not_found", "artifact not found"),
             }
@@ -1443,10 +1502,45 @@ fn blob(
             };
             let blocks = store.blocks_dir(id);
             let file = store.file(&store.artifacts[idx]);
+            let dir = store.dir.clone();
             // Blocks are written and joined while other jobs' calls go on; only
             // the size is set under the lock.
             drop(store);
-            let result = write_block_blob(req, &blocks, &file);
+            let comp = req.query.get("comp").map(String::as_str);
+            let result: Result<Option<u64>> = (|| {
+                Ok(match comp {
+                    Some("block") => {
+                        let block = req.query.get("blockid").cloned().unwrap_or_default();
+                        std::fs::create_dir_all(&blocks)?;
+                        std::fs::write(blocks.join(hex::encode(block)), &req.body)?;
+                        None
+                    }
+                    Some("blocklist") => {
+                        let xml = String::from_utf8_lossy(&req.body);
+                        std::fs::create_dir_all(file.parent().unwrap_or(&dir))?;
+                        let mut out = std::fs::File::create(&file)?;
+                        let mut size = 0u64;
+                        for chunk in xml.split('>').skip(1) {
+                            let Some((block, _)) = chunk.split_once('<') else {
+                                continue;
+                            };
+                            let block = block.trim();
+                            if block.is_empty() {
+                                continue;
+                            }
+                            let mut data = std::fs::File::open(blocks.join(hex::encode(block)))?;
+                            size += std::io::copy(&mut data, &mut out)?;
+                        }
+                        let _ = std::fs::remove_dir_all(&blocks);
+                        Some(size)
+                    }
+                    _ => {
+                        std::fs::create_dir_all(file.parent().unwrap_or(&dir))?;
+                        std::fs::write(&file, &req.body)?;
+                        Some(req.body.len() as u64)
+                    }
+                })
+            })();
             match result {
                 Ok(size) => {
                     if let Some(size) = size {
@@ -2452,70 +2546,92 @@ mod tests {
     }
 
     /// A Put Block List sent again after it succeeded (its 201 lost on the way)
-    /// answers 201 with the same blob; one naming a missing block fails and
-    /// leaves what was there. Shared with the artifact server.
+    /// answers 201 with the same upload; one naming a missing block fails and
+    /// leaves what was there.
     #[test]
-    fn block_lists_are_atomic_and_can_be_repeated() {
+    fn cache_v2_block_lists_are_atomic_and_can_be_repeated() {
         let dir = tempfile::tempdir().unwrap();
-        let (blocks, file) = (dir.path().join("blocks"), dir.path().join("out").join("f"));
-        let put = |query: &str, body: &[u8]| {
-            write_block_blob(
-                &url_req("PUT", &format!("http://h:1/x?{query}"), "", &[], body),
-                &blocks,
-                &file,
-            )
-        };
-        put("comp=block&blockid=b1", b"hello ").unwrap();
-        put("comp=block&blockid=b2", b"world").unwrap();
-        let list = b"<BlockList><Latest>b1</Latest><Latest>b2</Latest></BlockList>";
-        for _ in 0..2 {
-            assert_eq!(put("comp=blocklist", list).unwrap(), Some(11));
-            assert_eq!(std::fs::read(&file).unwrap(), b"hello world");
-        }
-        let broken = b"<BlockList><Latest>b2</Latest><Latest>b3</Latest></BlockList>";
-        assert!(put("comp=blocklist", broken).is_err());
-        assert_eq!(std::fs::read(&file).unwrap(), b"hello world");
-        // Nothing staged is left beside the file.
-        assert_eq!(
-            std::fs::read_dir(file.parent().unwrap()).unwrap().count(),
-            1
-        );
-
-        // Through the cache API: a repeated list is a 201, a broken one a 400,
-        // and neither changes the upload.
-        let cache_dir = tempfile::tempdir().unwrap();
         let auth = RuntimeAuth::new(None);
         let token = auth.issue(&json!({}));
-        let v2 = v2_service(cache_dir.path(), auth);
+        let v2 = v2_service(dir.path(), auth);
         let h = |req| cache_server(&v2, "tok", req);
         let url = v2_create(&h, &token, "k");
-        assert_eq!(
-            h(url_req(
-                "PUT",
-                &url,
-                "comp=block&blockid=AAAA",
-                &[],
-                b"data"
-            ))
-            .status,
-            201
-        );
-        let list = b"<BlockList><Latest>AAAA</Latest></BlockList>";
+        for (block, data) in [("AAAA", b"hello ".as_slice()), ("AAAB", b"world")] {
+            let extra = format!("comp=block&blockid={block}");
+            assert_eq!(h(url_req("PUT", &url, &extra, &[], data)).status, 201);
+        }
+        let staging = v2.store.lock().unwrap().staging(1);
+        let list = b"<BlockList><Latest>AAAA</Latest><Latest>AAAB</Latest></BlockList>";
         for _ in 0..2 {
             assert_eq!(
                 h(url_req("PUT", &url, "comp=blocklist", &[], list)).status,
                 201
             );
+            assert_eq!(std::fs::read(&staging).unwrap(), b"hello world");
         }
-        let broken = b"<BlockList><Latest>AAAA</Latest><Latest>AAAB</Latest></BlockList>";
+        let broken = b"<BlockList><Latest>AAAB</Latest><Latest>AAAC</Latest></BlockList>";
         assert_eq!(
             h(url_req("PUT", &url, "comp=blocklist", &[], broken)).status,
             400
         );
-        let staging = v2.store.lock().unwrap().staging(1);
-        assert_eq!(std::fs::read(staging).unwrap(), b"data");
-        assert_eq!(v2_finalize(&h, &token, "k", json!("4"))["ok"], true);
-        assert_eq!(v2_restore(&h, &token, "k", &[]).unwrap().1, b"data");
+        assert_eq!(std::fs::read(&staging).unwrap(), b"hello world");
+        // Nothing staged is left beside the upload.
+        assert_eq!(blob_files(&v2), ["1.upload"]);
+        assert_eq!(v2_finalize(&h, &token, "k", json!("11"))["ok"], true);
+        assert_eq!(v2_restore(&h, &token, "k", &[]).unwrap().1, b"hello world");
+    }
+
+    /// A block list body that does not parse, or a `comp` this server does not
+    /// know, is refused and leaves the upload as it was.
+    #[test]
+    fn cache_v2_refuses_unparsable_block_lists_and_unknown_comps() {
+        let parsed = block_list(
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<BlockList>\n  <Latest>a</Latest><Committed>b</Committed><Uncommitted>c</Uncommitted>\n</BlockList>\n",
+        );
+        assert_eq!(parsed.unwrap(), ["a", "b", "c"]);
+        assert_eq!(
+            block_list(b"<BlockList></BlockList>"),
+            Some(Vec::<String>::new())
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let url = v2_create(&h, &token, "k");
+        assert_eq!(h(url_req("PUT", &url, "", &[], b"whole")).status, 201);
+        assert_eq!(
+            h(url_req("PUT", &url, "comp=block&blockid=AAAA", &[], b"x")).status,
+            201
+        );
+        for list in [
+            b"<BlockList>".as_slice(),
+            b"<BlockList><Latest>AAAA</BlockList>",
+            b"<BlockList><Latest>AAAA</Latest>",
+            b"<BlockList><Other>AAAA</Other></BlockList>",
+            b"<BlockList><Latest></Latest></BlockList>",
+            b"<BlockList><Latest>AAAA</Latest></BlockList>trailing",
+            b"garbage",
+            b"",
+        ] {
+            let put = h(url_req("PUT", &url, "comp=blocklist", &[], list));
+            assert_eq!(put.status, 400, "{}", String::from_utf8_lossy(list));
+        }
+        for comp in ["comp=properties", "comp=appendblock", "comp="] {
+            assert_eq!(
+                h(url_req("PUT", &url, comp, &[], b"evil")).status,
+                400,
+                "{comp}"
+            );
+        }
+        let store = v2.store.lock().unwrap();
+        assert_eq!(std::fs::read(store.staging(1)).unwrap(), b"whole");
+        assert_eq!(std::fs::read_dir(store.blocks(1)).unwrap().count(), 1);
+        drop(store);
+        assert_eq!(blob_files(&v2), ["1.upload"]);
+        assert_eq!(v2_finalize(&h, &token, "k", json!("5"))["ok"], true);
+        assert_eq!(v2_restore(&h, &token, "k", &[]).unwrap().1, b"whole");
     }
 
     #[test]
@@ -2539,17 +2655,16 @@ mod tests {
         );
     }
 
-    /// `size_bytes` that is not an unsigned integer, or an upload whose data is
-    /// gone, is refused with a reason instead of committing an entry no
-    /// download can serve; a missing `size_bytes` still means 0.
+    /// `size_bytes` that is not an unsigned integer is refused with a reason.
     #[test]
-    fn cache_v2_finalize_refuses_bad_sizes_and_missing_data() {
+    fn cache_v2_finalize_refuses_bad_sizes() {
         let dir = tempfile::tempdir().unwrap();
         let auth = RuntimeAuth::new(None);
         let token = auth.issue(&json!({}));
         let v2 = v2_service(dir.path(), auth);
         let h = |req| cache_server(&v2, "tok", req);
-        v2_create(&h, &token, "k");
+        let url = v2_create(&h, &token, "k");
+        assert_eq!(h(url_req("PUT", &url, "", &[], b"")).status, 201);
         let invalid = json!({"ok": false, "message": "size_bytes is not a valid size"});
         for size in [
             json!("-1"),
@@ -2565,24 +2680,60 @@ mod tests {
             );
         }
         assert!(!v2.store.lock().unwrap().entries[0].complete);
-        let staging = v2.store.lock().unwrap().staging(1);
-        std::fs::remove_file(&staging).unwrap();
+        assert_eq!(v2_restore(&h, &token, "k", &[]), None);
+    }
+
+    /// A finalize commits only data an upload put in place: a zero-byte Put
+    /// Blob counts, a reservation without any PUT or with blocks but no block
+    /// list does not. A missing `size_bytes` means 0.
+    #[test]
+    fn cache_v2_finalize_needs_an_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let missing = json!({"ok": false, "message": "the uploaded data is missing"});
+        let url = v2_create(&h, &token, "k");
+        // The reservation itself creates no file.
+        assert!(blob_files(&v2).is_empty());
+        assert_eq!(v2_finalize(&h, &token, "k", json!("0")), missing);
         assert_eq!(
-            v2_finalize(&h, &token, "k", json!("0")),
-            json!({"ok": false, "message": "the uploaded data is missing"})
+            h(url_req(
+                "PUT",
+                &url,
+                "comp=block&blockid=AAAA",
+                &[],
+                b"data"
+            ))
+            .status,
+            201
         );
+        for size in [json!("0"), json!("4")] {
+            assert_eq!(v2_finalize(&h, &token, "k", size), missing);
+        }
         assert!(!v2.store.lock().unwrap().entries[0].complete);
         assert_eq!(v2_restore(&h, &token, "k", &[]), None);
-        // An empty upload with `size_bytes` left out (0) is a valid entry.
-        v2_create(&h, &token, "empty");
+        assert_eq!(h(url_req("PUT", &url, "", &[], b"")).status, 201);
         let (_, done) = v2_twirp(
             &h,
             Some(&token),
             "FinalizeCacheEntryUpload",
-            json!({"key": "empty", "version": "v"}),
+            json!({"key": "k", "version": "v"}),
         );
-        assert_eq!(done["ok"], true, "{done}");
-        assert_eq!(v2_restore(&h, &token, "empty", &[]).unwrap().1, b"");
+        assert_eq!(done, json!({"ok": true, "entry_id": "1"}));
+        assert_eq!(v2_restore(&h, &token, "k", &[]).unwrap().1, b"");
+    }
+
+    /// Run `f` once, on this thread, where the next cache v2 PUT has passed its
+    /// pending check and staged its data but not yet put it in place.
+    fn on_next_stage(f: impl FnOnce() + 'static) {
+        AFTER_STAGE.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    /// Whether the armed `on_next_stage` ran.
+    fn stage_hook_ran() -> bool {
+        AFTER_STAGE.with(|h| h.borrow().is_none())
     }
 
     /// A PUT that passed its pending check before a finalize or `gc` and lands
@@ -2599,14 +2750,18 @@ mod tests {
             let s = v2.store.lock().unwrap();
             (s.blob(id), s.blocks(id), s.staging(id))
         };
-        // A retried Put Blob is received while the first one commits.
+        // A retried Put Blob passes its check, and the first one commits
+        // before the retry lands.
         let url = v2_create(&h, &token, "k");
         assert_eq!(h(url_req("PUT", &url, "", &[], b"good")).status, 201);
-        let (blob, blocks, staging) = paths(1);
-        let late =
-            stage_block_blob(&url_req("PUT", &url, "", &[], b"evil!"), &blocks, &staging).unwrap();
-        assert_eq!(v2_finalize(&h, &token, "k", json!("4"))["ok"], true);
-        assert_eq!(v2.place(1, late).status, 404);
+        let (racer, t) = (v2.clone(), token.clone());
+        on_next_stage(move || {
+            let h = |req| cache_server(&racer, "tok", req);
+            assert_eq!(v2_finalize(&h, &t, "k", json!("4"))["ok"], true);
+        });
+        assert_eq!(h(url_req("PUT", &url, "", &[], b"evil!")).status, 404);
+        assert!(stage_hook_ran());
+        let (blob, _, staging) = paths(1);
         assert_eq!(std::fs::read(&blob).unwrap(), b"good");
         assert!(!staging.exists());
         // A PUT sent after the commit is refused before it is read.
@@ -2614,20 +2769,137 @@ mod tests {
         assert_eq!(v2_restore(&h, &token, "k", &[]).unwrap().1, b"good");
         assert_eq!(blob_files(&v2), ["1"]);
 
-        // A Put Blob and a Put Block are received while `gc` drops the upload.
-        let url = v2_create(&h, &token, "gone");
-        let (blob, blocks, staging) = paths(2);
-        let late_blob =
-            stage_block_blob(&url_req("PUT", &url, "", &[], b"late"), &blocks, &staging).unwrap();
-        let block = url_req("PUT", &url, "comp=block&blockid=AAAA", &[], b"late");
-        let late_block = stage_block_blob(&block, &blocks, &staging).unwrap();
-        age(&v2, 2, 10);
-        v2.store.lock().unwrap().gc(now());
-        assert!(v2.store.lock().unwrap().entries.iter().all(|e| e.id != 2));
-        assert_eq!(v2.place(2, late_blob).status, 404);
-        assert_eq!(v2.place(2, late_block).status, 404);
-        assert!(!blob.exists() && !staging.exists() && !blocks.exists());
+        // A Put Blob and a Put Block pass their check, and `gc` drops their
+        // upload before they land.
+        for (id, key, extra) in [
+            (2, "gone-blob", ""),
+            (3, "gone-block", "comp=block&blockid=AAAA"),
+        ] {
+            let url = v2_create(&h, &token, key);
+            let racer = v2.clone();
+            on_next_stage(move || {
+                age(&racer, id, 10);
+                racer.store.lock().unwrap().gc(now());
+            });
+            assert_eq!(
+                h(url_req("PUT", &url, extra, &[], b"late")).status,
+                404,
+                "{key}"
+            );
+            assert!(stage_hook_ran());
+            assert!(v2.store.lock().unwrap().entries.iter().all(|e| e.id != id));
+            let (blob, blocks, staging) = paths(id);
+            assert!(
+                !blob.exists() && !staging.exists() && !blocks.exists(),
+                "{key}"
+            );
+        }
         assert_eq!(blob_files(&v2), ["1"]);
+    }
+
+    /// The v1 routes do not take, commit or serve a reservation made through
+    /// v2 before its finalize; a v1 reservation is still v1's.
+    #[test]
+    fn v1_routes_leave_v2_reservations_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let v1 = |method: &str, rest: &str, body: &[u8]| {
+            h(Request {
+                method: method.into(),
+                path: format!("/tok/_apis/artifactcache/{rest}"),
+                query: HashMap::new(),
+                headers: HashMap::from([("content-range".to_string(), "bytes 0-3/*".to_string())]),
+                body: body.to_vec(),
+            })
+        };
+        let url = v2_create(&h, &token, "k");
+        assert_eq!(h(url_req("PUT", &url, "", &[], b"good")).status, 201);
+        assert_eq!(v1("PATCH", "caches/1", b"evil").status, 404);
+        assert_eq!(v1("POST", "caches/1", b"").status, 404);
+        assert_eq!(v1("GET", "artifacts/1", b"").status, 404);
+        let blob = {
+            let store = v2.store.lock().unwrap();
+            assert!(!store.entries[0].complete && store.reserved_by_v2(1));
+            assert_eq!(std::fs::read(store.staging(1)).unwrap(), b"good");
+            assert!(!store.blob(1).exists());
+            store.blob(1)
+        };
+        // Not even once a file is at the blob path, as at the moment a v1
+        // PATCH that passed its check would open it after a v2 finalize.
+        std::fs::write(&blob, b"published").unwrap();
+        assert_eq!(v1("PATCH", "caches/1", b"evil").status, 404);
+        assert_eq!(v1("GET", "artifacts/1", b"").status, 404);
+        assert_eq!(std::fs::read(&blob).unwrap(), b"published");
+        assert_eq!(
+            v2_finalize(&h, &token, "k", json!("4")),
+            json!({"ok": true, "entry_id": "1"})
+        );
+        // Complete, it is an ordinary entry for v1 too.
+        assert_eq!(on_wire(&v1("GET", "artifacts/1", b"")).1, b"good");
+        assert_eq!(v1("PATCH", "caches/1", b"evil").status, 404);
+
+        let reserve = json!({"key": "v1", "version": "v"}).to_string();
+        assert_eq!(v1("POST", "caches", reserve.as_bytes()).status, 201);
+        assert_eq!(v1("PATCH", "caches/2", b"abcd").status, 204);
+        assert_eq!(v1("POST", "caches/2", b"").status, 204);
+        assert_eq!(on_wire(&v1("GET", "artifacts/2", b"")).1, b"abcd");
+    }
+
+    /// A v1 chunk counts as use: `gc` keeps the reservation and a v2 Create of
+    /// the same key gets the conflict; without one for 5 minutes it is
+    /// abandoned.
+    #[test]
+    fn v1_uploads_keep_their_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let v1 = |method: &str, rest: &str, body: &[u8]| {
+            h(Request {
+                method: method.into(),
+                path: format!("/tok/_apis/artifactcache/{rest}"),
+                query: HashMap::new(),
+                headers: HashMap::from([("content-range".to_string(), "bytes 0-3/*".to_string())]),
+                body: body.to_vec(),
+            })
+        };
+        let reserve = |key: &str| {
+            let body = json!({"key": key, "version": "v"}).to_string();
+            assert_eq!(v1("POST", "caches", body.as_bytes()).status, 201);
+        };
+        reserve("busy");
+        reserve("idle");
+        age(&v2, 1, 6);
+        age(&v2, 2, 6);
+        assert_eq!(v1("PATCH", "caches/1", b"abcd").status, 204);
+        v2.store.lock().unwrap().gc(now());
+        let ids: Vec<u64> = v2
+            .store
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, [1]);
+        let (status, _) = v2_twirp(
+            &h,
+            Some(&token),
+            "CreateCacheEntry",
+            json!({"key": "busy", "version": "v"}),
+        );
+        assert_eq!(status, 409);
+        assert_eq!(v1("POST", "caches/1", b"").status, 204);
+        assert_eq!(on_wire(&v1("GET", "artifacts/1", b"")).1, b"abcd");
+        // Without a chunk for 5 minutes, v2 takes the key over.
+        reserve("slow");
+        age(&v2, 3, 6);
+        assert!(v2_create(&h, &token, "slow").contains("/upload/4?"));
+        assert_eq!(v1("PATCH", "caches/3", b"late").status, 404);
     }
 
     /// While a reservation of a key and version is in use, another job gets
@@ -2779,7 +3051,8 @@ mod tests {
             h(url_req("PUT", &url, "comp=block&blockid=AAAA", &[], b"x")).status,
             201
         );
-        assert_eq!(files(1), [true, true, true]);
+        // Only a finalize publishes the blob.
+        assert_eq!(files(1), [false, true, true]);
         age(&v2, 1, 20);
         let url = v2_create(&h, &token, "k");
         assert_eq!(files(1), [false, false, false]);
@@ -3039,6 +3312,9 @@ mod tests {
                 json!({"key": key, "version": "v"}),
             );
             assert_eq!(status, 200);
+            if let Some(url) = created["signed_upload_url"].as_str() {
+                assert_eq!(h(url_req("PUT", url, "", &[], b"")).status, 201);
+            }
             // Size 0 is left out, as the toolkit's encoder does.
             let (status, done) = v2_twirp(
                 &h,
@@ -3078,7 +3354,11 @@ mod tests {
             Some("garbage"),
             Some(forged.as_str()),
         ] {
-            for method in ["CreateCacheEntry", "GetCacheEntryDownloadURL"] {
+            for method in [
+                "CreateCacheEntry",
+                "FinalizeCacheEntryUpload",
+                "GetCacheEntryDownloadURL",
+            ] {
                 let (status, body) = v2_twirp(&h, bad, method, json!({"key": "k", "version": "v"}));
                 assert_eq!(status, 401, "{bad:?}");
                 assert_eq!(
