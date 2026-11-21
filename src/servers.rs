@@ -595,17 +595,24 @@ fn cache_handler(shared: Arc<Mutex<CacheStore>>, token: &str, req: Request) -> R
                     f.seek(SeekFrom::Start(start))?;
                     f.write_all(&req.body)
                 });
-            match written {
-                Ok(()) => {
-                    // An upload in progress is not abandoned, for `gc` or a v2
-                    // reservation of the same key.
-                    let mut store = shared.lock().unwrap();
-                    if let Some(e) = store.entries.iter_mut().find(|e| e.id == id && !e.complete) {
-                        e.used = now();
-                    }
+            if written.is_err() {
+                return Response::empty(404);
+            }
+            race_point();
+            let mut store = shared.lock().unwrap();
+            match store.entries.iter_mut().find(|e| e.id == id) {
+                // An upload in progress is not abandoned, for `gc` or a v2
+                // reservation of the same key.
+                Some(e) if !e.complete => {
+                    e.used = now();
                     Response::empty(204)
                 }
-                Err(_) => Response::empty(404),
+                Some(_) => Response::empty(404),
+                // Dropped while the chunk was written: its file goes too.
+                None => {
+                    let _ = std::fs::remove_file(store.blob(id));
+                    Response::empty(404)
+                }
             }
         }
         ("POST", ["caches", id]) => {
@@ -903,7 +910,7 @@ fn cache_v2_blob(v2: &CacheV2, req: &Request) -> Response {
     }
     match stage_block_blob(req, &blocks, &staging) {
         Ok(staged) => {
-            after_stage();
+            race_point();
             v2.place(id, staged)
         }
         Err(_) => Response::empty(400),
@@ -1153,17 +1160,18 @@ fn block_list(body: &[u8]) -> Option<Vec<String>> {
 
 #[cfg(test)]
 thread_local! {
-    /// Run once by `after_stage`: a test's finalize or `gc` between a PUT's
-    /// pending check and its placing.
-    static AFTER_STAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+    /// Run once by `race_point`: a test's finalize or `gc` between an upload's
+    /// pending check and the moment it takes the lock again.
+    static RACE_POINT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Where a cache v2 PUT has staged its data but not yet placed it; a test can
-/// interleave other calls here.
-fn after_stage() {
+/// Where an upload has received its data without the lock (a cache v2 PUT
+/// staged it, a v1 PATCH wrote its chunk) and has not taken the lock again; a
+/// test can interleave other calls here.
+fn race_point() {
     #[cfg(test)]
-    if let Some(f) = AFTER_STAGE.with(|h| h.borrow_mut().take()) {
+    if let Some(f) = RACE_POINT.with(|h| h.borrow_mut().take()) {
         f();
     }
 }
@@ -1745,6 +1753,9 @@ impl Servers {
             "nbf": 0,
             "exp": 4_102_444_800u64,
             "runthrough_cache_mode": cache_mode.name(),
+            // Unique per job leg, so no two jobs share a token (with --reuse two
+            // jobs can share a name): a cache v2 reservation is its token's.
+            "jti": random_token(),
         });
         env.push(("ACTIONS_RUNTIME_TOKEN".into(), self.auth.issue(&claims)));
         // As in act, values from the caller's environment win.
@@ -2725,15 +2736,15 @@ mod tests {
         assert_eq!(v2_restore(&h, &token, "k", &[]).unwrap().1, b"");
     }
 
-    /// Run `f` once, on this thread, where the next cache v2 PUT has passed its
-    /// pending check and staged its data but not yet put it in place.
-    fn on_next_stage(f: impl FnOnce() + 'static) {
-        AFTER_STAGE.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    /// Run `f` once, on this thread, where the next upload has passed its
+    /// pending check and received its data but not yet taken the lock again.
+    fn on_next_race_point(f: impl FnOnce() + 'static) {
+        RACE_POINT.with(|h| *h.borrow_mut() = Some(Box::new(f)));
     }
 
-    /// Whether the armed `on_next_stage` ran.
-    fn stage_hook_ran() -> bool {
-        AFTER_STAGE.with(|h| h.borrow().is_none())
+    /// Whether the armed `on_next_race_point` ran.
+    fn race_point_ran() -> bool {
+        RACE_POINT.with(|h| h.borrow().is_none())
     }
 
     /// A PUT that passed its pending check before a finalize or `gc` and lands
@@ -2755,12 +2766,12 @@ mod tests {
         let url = v2_create(&h, &token, "k");
         assert_eq!(h(url_req("PUT", &url, "", &[], b"good")).status, 201);
         let (racer, t) = (v2.clone(), token.clone());
-        on_next_stage(move || {
+        on_next_race_point(move || {
             let h = |req| cache_server(&racer, "tok", req);
             assert_eq!(v2_finalize(&h, &t, "k", json!("4"))["ok"], true);
         });
         assert_eq!(h(url_req("PUT", &url, "", &[], b"evil!")).status, 404);
-        assert!(stage_hook_ran());
+        assert!(race_point_ran());
         let (blob, _, staging) = paths(1);
         assert_eq!(std::fs::read(&blob).unwrap(), b"good");
         assert!(!staging.exists());
@@ -2777,7 +2788,7 @@ mod tests {
         ] {
             let url = v2_create(&h, &token, key);
             let racer = v2.clone();
-            on_next_stage(move || {
+            on_next_race_point(move || {
                 age(&racer, id, 10);
                 racer.store.lock().unwrap().gc(now());
             });
@@ -2786,7 +2797,7 @@ mod tests {
                 404,
                 "{key}"
             );
-            assert!(stage_hook_ran());
+            assert!(race_point_ran());
             assert!(v2.store.lock().unwrap().entries.iter().all(|e| e.id != id));
             let (blob, blocks, staging) = paths(id);
             assert!(
@@ -2900,6 +2911,101 @@ mod tests {
         age(&v2, 3, 6);
         assert!(v2_create(&h, &token, "slow").contains("/upload/4?"));
         assert_eq!(v1("PATCH", "caches/3", b"late").status, 404);
+    }
+
+    /// Two `job_env` calls for the same job name (as two jobs whose `--reuse`
+    /// names coincide get) issue different tokens, and neither can finalize
+    /// the other's reservation.
+    #[test]
+    fn job_env_tokens_are_unique_per_job_leg() {
+        let dir = tempfile::tempdir().unwrap();
+        let v2 = v2_service(dir.path(), RuntimeAuth::new(None));
+        let servers = Servers {
+            cache_port: Some(1),
+            cache_token: "tok".into(),
+            cache_external: None,
+            artifact_port: None,
+            run_id: "7".into(),
+            auth: v2.auth.clone(),
+        };
+        let token = || {
+            servers
+                .job_env("h", "j", CacheMode::Write)
+                .into_iter()
+                .find(|(k, _)| k == "ACTIONS_RUNTIME_TOKEN")
+                .unwrap()
+                .1
+        };
+        let claims = |t: &str| -> Value {
+            serde_json::from_slice(&base64url_decode(t.split('.').nth(1).unwrap()).unwrap())
+                .unwrap()
+        };
+        let (a, b) = (token(), token());
+        assert_ne!(a, b);
+        let (mut ca, mut cb) = (claims(&a), claims(&b));
+        assert!(ca["jti"].is_string() && ca["jti"] != cb["jti"]);
+        // Only the `jti` claim tells them apart.
+        ca.as_object_mut().unwrap().remove("jti");
+        cb.as_object_mut().unwrap().remove("jti");
+        assert_eq!(ca, cb);
+        let h = |req| cache_server(&v2, "tok", req);
+        let url = v2_create(&h, &a, "k");
+        assert_eq!(h(url_req("PUT", &url, "", &[], b"AAAA")).status, 201);
+        assert_eq!(
+            v2_finalize(&h, &b, "k", json!("4")),
+            json!({"ok": false, "message": "no pending upload for this key and version"})
+        );
+        assert_eq!(
+            v2_finalize(&h, &a, "k", json!("4")),
+            json!({"ok": true, "entry_id": "1"})
+        );
+    }
+
+    /// A v1 chunk written while its reservation is dropped is refused, and
+    /// its file does not stay behind.
+    #[test]
+    fn v1_chunks_for_a_dropped_reservation_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let v2 = v2_service(dir.path(), RuntimeAuth::new(None));
+        let h = |req| cache_server(&v2, "tok", req);
+        let v1 = |method: &str, rest: &str, body: &[u8]| {
+            h(Request {
+                method: method.into(),
+                path: format!("/tok/_apis/artifactcache/{rest}"),
+                query: HashMap::new(),
+                headers: HashMap::from([("content-range".to_string(), "bytes 0-3/*".to_string())]),
+                body: body.to_vec(),
+            })
+            .status
+        };
+        let reserve = |key: &str| {
+            let body = json!({"key": key, "version": "v"}).to_string();
+            assert_eq!(v1("POST", "caches", body.as_bytes()), 201);
+        };
+        let blob = |id| v2.store.lock().unwrap().blob(id);
+        // `gc` drops the reservation once the chunk is written.
+        reserve("k");
+        let racer = v2.clone();
+        on_next_race_point(move || {
+            age(&racer, 1, 10);
+            racer.store.lock().unwrap().gc(now());
+        });
+        assert_eq!(v1("PATCH", "caches/1", b"abcd"), 404);
+        assert!(race_point_ran());
+        assert!(v2.store.lock().unwrap().entries.is_empty());
+        assert!(!blob(1).exists());
+        // Dropped from the index while its file stays (as when removing a
+        // file that is still open fails): the PATCH removes it.
+        reserve("j");
+        let racer = v2.clone();
+        on_next_race_point(move || racer.store.lock().unwrap().entries.retain(|e| e.id != 2));
+        assert_eq!(v1("PATCH", "caches/2", b"abcd"), 404);
+        assert!(race_point_ran());
+        assert!(!blob(2).exists());
+        // A chunk for a reservation still pending is taken as before.
+        reserve("m");
+        assert_eq!(v1("PATCH", "caches/3", b"abcd"), 204);
+        assert_eq!(std::fs::read(blob(3)).unwrap(), b"abcd");
     }
 
     /// While a reservation of a key and version is in use, another job gets
