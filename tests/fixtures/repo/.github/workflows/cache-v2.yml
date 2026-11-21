@@ -16,7 +16,10 @@ jobs:
     env:
       ACTIONS_CACHE_URL: ""
     steps:
+      - run: rm -rf v2-cache   # a shared workspace (--bind) must not leak the saved file
       - uses: actions/cache/restore@v4
         with: { path: v2-cache, key: v2-roundtrip, fail-on-cache-miss: true }
+      - run: |
+          printf '%s\n' 'v2 roundtrip' | cmp - v2-cache/data.txt
       - run: |
           echo "cache v2 restored: $(cat v2-cache/data.txt)"
