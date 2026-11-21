@@ -855,6 +855,44 @@ fn real_upload_and_download_artifact_v3_and_v4() {
     assert!(out.contains("artifacts / down: success"), "{out}");
 }
 
+/// `ACTIONS_CACHE_URL` is blanked in the fixture jobs, so `actions/cache@v4` can only
+/// save and restore through the cache service v2 API (`ACTIONS_CACHE_SERVICE_V2`).
+#[test]
+#[ignore = "binds local ports and needs actions/cache@v4 (cached or fetched from github.com)"]
+fn real_actions_cache_v4_saves_and_restores_through_v2() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = bin()
+        .args(["-C", FIXTURE, "--host", "registry_package"])
+        .arg("--cache-server-path")
+        .arg(dir.path())
+        // Only what runthrough injects may decide the cache API version.
+        .env("GITHUB_SERVER_URL", "https://github.com")
+        .env_remove("ACTIONS_CACHE_SERVICE_V2")
+        .env_remove("ACTIONS_RESULTS_URL")
+        .env_remove("ACTIONS_CACHE_URL")
+        .env_remove("ACTIONS_RUNTIME_TOKEN")
+        .output()
+        .unwrap();
+    let (status, stderr) = (
+        out.status,
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    );
+    let out = String::from_utf8_lossy(&out.stdout);
+    let diag = format!("status: {status}\nstdout:\n{out}\nstderr:\n{stderr}");
+    assert!(out.contains("cache v2 restored: v2 roundtrip"), "{diag}");
+    assert!(out.contains("cache-v2 / v2-restore: success"), "{diag}");
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("index.json")).unwrap()).unwrap();
+    assert!(
+        index
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["key"] == "v2-roundtrip" && e["complete"] == true),
+        "{index}"
+    );
+}
+
 /// A remote engine (DOCKER_HOST=ssh://…) cannot see host paths; forcing that
 /// mode on a local Docker exercises the volume + `docker cp` path.
 #[test]
