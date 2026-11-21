@@ -1,6 +1,12 @@
 //! Local stand-ins for the GitHub services actions talk to:
 //!
-//! - a cache server speaking the `@actions/cache` v1 API (`ACTIONS_CACHE_URL`), and
+//! - a cache server speaking the `@actions/cache` v1 API (`ACTIONS_CACHE_URL`) and the
+//!   cache service v2 API (`ACTIONS_CACHE_SERVICE_V2`, `@actions/cache` 4 and later): Twirp
+//!   JSON calls under `/twirp/github.actions.results.api.v1.CacheService/` at the root of
+//!   `ACTIONS_RESULTS_URL`'s origin, plus Azure-blob-style uploads and plain downloads at
+//!   signed `/cache-v2/` URLs; both APIs share one store, and v2 reads the job's
+//!   `cache-mode` from its runtime token. With the artifact server on, `ACTIONS_RESULTS_URL`
+//!   names the artifact port, which forwards the v2 routes to the cache server's handler; and
 //! - an artifact server speaking the `@actions/artifact` v2 API used by
 //!   `actions/upload-artifact@v4` / `download-artifact@v4` (`ACTIONS_RESULTS_URL`):
 //!   Twirp JSON calls plus Azure-blob-style block uploads to a signed URL, and
@@ -313,6 +319,8 @@ impl CacheStore {
             });
         for e in &drop {
             let _ = std::fs::remove_file(self.blob(e.id));
+            // A v2 block upload that never got its block list.
+            let _ = std::fs::remove_dir_all(self.blocks(e.id));
         }
         self.entries = keep;
         if !drop.is_empty() {
@@ -328,6 +336,51 @@ impl CacheStore {
 
     fn blob(&self, id: u64) -> PathBuf {
         self.dir.join("blobs").join(id.to_string())
+    }
+
+    /// Where a v2 upload's blocks wait for their block list.
+    fn blocks(&self, id: u64) -> PathBuf {
+        self.dir.join("blocks").join(id.to_string())
+    }
+
+    /// A pending entry for `key` (lowercased) and `version` with an empty blob,
+    /// replacing pending ones of the same key and version; `None` when a complete
+    /// one exists. Shared by the v1 and v2 APIs.
+    fn reserve(&mut self, key: &str, version: &str) -> Option<u64> {
+        let key = key.to_lowercase();
+        if self
+            .entries
+            .iter()
+            .any(|e| e.complete && e.key == key && e.version == version)
+        {
+            return None;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.entries
+            .retain(|e| !(e.key == key && e.version == version));
+        self.entries.push(CacheEntry {
+            id,
+            key,
+            version: version.to_string(),
+            complete: false,
+            created: now(),
+            used: now(),
+        });
+        let _ = std::fs::write(self.blob(id), b"");
+        Some(id)
+    }
+
+    /// Mark the pending entry `id` complete; false when there is none.
+    fn commit(&mut self, id: u64) -> bool {
+        let Some(e) = self.entries.iter_mut().find(|e| e.id == id && !e.complete) else {
+            return false;
+        };
+        e.complete = true;
+        e.used = now();
+        self.save();
+        self.gc(now());
+        true
     }
 
     /// Exact key first, then the newest entry whose key starts with a restore key.
@@ -447,30 +500,12 @@ fn cache_handler(store: Arc<Mutex<CacheStore>>, token: &str, req: Request) -> Re
             }
         }
         ("POST", ["caches"]) => {
-            let key = body["key"].as_str().unwrap_or_default().to_lowercase();
-            let version = body["version"].as_str().unwrap_or_default().to_string();
-            if store
-                .entries
-                .iter()
-                .any(|e| e.complete && e.key == key && e.version == version)
-            {
-                return Response::json(409, json!({"message": "cache already exists"}));
+            let key = body["key"].as_str().unwrap_or_default();
+            let version = body["version"].as_str().unwrap_or_default();
+            match store.reserve(key, version) {
+                Some(id) => Response::json(201, json!({"cacheId": id})),
+                None => Response::json(409, json!({"message": "cache already exists"})),
             }
-            let id = store.next_id;
-            store.next_id += 1;
-            store
-                .entries
-                .retain(|e| !(e.key == key && e.version == version));
-            store.entries.push(CacheEntry {
-                id,
-                key,
-                version,
-                complete: false,
-                created: now(),
-                used: now(),
-            });
-            let _ = std::fs::write(store.blob(id), b"");
-            Response::json(201, json!({"cacheId": id}))
         }
         ("PATCH", ["caches", id]) => {
             let Ok(id) = id.parse::<u64>() else {
@@ -507,15 +542,10 @@ fn cache_handler(store: Arc<Mutex<CacheStore>>, token: &str, req: Request) -> Re
             let Ok(id) = id.parse::<u64>() else {
                 return Response::empty(400);
             };
-            match store.entries.iter_mut().find(|e| e.id == id && !e.complete) {
-                Some(e) => {
-                    e.complete = true;
-                    e.used = now();
-                    store.save();
-                    store.gc(now());
-                    Response::empty(204)
-                }
-                None => Response::empty(404),
+            if store.commit(id) {
+                Response::empty(204)
+            } else {
+                Response::empty(404)
             }
         }
         ("GET", ["artifacts", id]) => match id.parse::<u64>().map(|id| store.blob(id)) {
@@ -523,6 +553,223 @@ fn cache_handler(store: Arc<Mutex<CacheStore>>, token: &str, req: Request) -> Re
             Err(_) => Response::empty(400),
         },
         _ => Response::empty(404),
+    }
+}
+
+// ------------------------------------------------------------------ cache (v2 API)
+
+/// Twirp prefix of the cache service v2 API.
+const CACHE_SERVICE: &str = "/twirp/github.actions.results.api.v1.CacheService/";
+/// Twirp prefix of the v4 artifact API.
+const ARTIFACT_SERVICE: &str = "/twirp/github.actions.results.api.v1.ArtifactService/";
+
+/// State of the cache service v2 API, served by the cache server and, with the
+/// artifact server on, forwarded from it.
+#[derive(Clone)]
+struct CacheV2 {
+    /// The same store the v1 API uses.
+    store: Arc<Mutex<CacheStore>>,
+    /// Signs the `/cache-v2/` blob URLs; not the artifact server's key.
+    signer: UrlSigner,
+    auth: RuntimeAuth,
+}
+
+/// The cache server: v2 routes, a pointer to `--artifact-server-path` for
+/// artifact calls (`ACTIONS_RESULTS_URL` names this port when the artifact
+/// server is off), and the v1 API under the per-run `token` prefix.
+fn cache_server(v2: &CacheV2, token: &str, req: Request) -> Response {
+    if let Some(r) = cache_v2_route(v2, &req) {
+        return r;
+    }
+    if req.path.starts_with(ARTIFACT_SERVICE) {
+        return twirp_error(
+            404,
+            "bad_route",
+            "the artifact server is off: run with --artifact-server-path",
+        );
+    }
+    cache_handler(v2.store.clone(), token, req)
+}
+
+/// The v2 routes (`/twirp/…CacheService/<method>`, `/cache-v2/…`); `None` for
+/// any other path.
+fn cache_v2_route(v2: &CacheV2, req: &Request) -> Option<Response> {
+    if let Some(method) = req.path.strip_prefix(CACHE_SERVICE) {
+        return Some(cache_v2_twirp(v2, method, req));
+    }
+    req.path
+        .starts_with("/cache-v2/")
+        .then(|| cache_v2_blob(v2, req))
+}
+
+/// The cache service v2 Twirp calls. Every answer has a JSON body: the toolkit
+/// retries any other for about 20 seconds.
+fn cache_v2_twirp(v2: &CacheV2, method: &str, req: &Request) -> Response {
+    let Some(claims) = v2.auth.claims(req) else {
+        return twirp_error(
+            401,
+            "unauthenticated",
+            "missing or invalid ACTIONS_RUNTIME_TOKEN",
+        );
+    };
+    if req.method != "POST" {
+        return twirp_error(404, "bad_route", method);
+    }
+    // The path cannot carry the job's cache-mode (the toolkit drops it), so the
+    // token does; the caller's own token has no such claim and means `write`.
+    let mode = claims["runthrough_cache_mode"]
+        .as_str()
+        .and_then(CacheMode::parse)
+        .unwrap_or(CacheMode::Write);
+    let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+    // The toolkit sends proto field names; protobuf JSON also allows lowerCamelCase.
+    let field = |camel: &str, snake: &str| -> Value {
+        body.get(snake)
+            .or_else(|| body.get(camel))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let key = body["key"].as_str().unwrap_or_default().to_lowercase();
+    let version = body["version"].as_str().unwrap_or_default();
+    let host = req.headers.get("host").cloned().unwrap_or_default();
+    // A refused save is `ok: false` with a reason, which the toolkit logs as a
+    // warning without failing the step.
+    let save_denied = || {
+        Response::json(
+            200,
+            json!({"ok": false, "message": format!("cache-mode {} does not allow saving", mode.name())}),
+        )
+    };
+    match method {
+        "CreateCacheEntry" => {
+            if !mode.can_save() {
+                return save_denied();
+            }
+            let Some(id) = v2.store.lock().unwrap().reserve(&key, version) else {
+                // Non-retryable: logged as "another job may be creating this cache".
+                return twirp_error(
+                    409,
+                    "already_exists",
+                    &format!("cache entry {key} already exists"),
+                );
+            };
+            Response::json(
+                200,
+                json!({"ok": true, "signedUploadUrl": format!(
+                    "http://{host}/cache-v2/upload/{id}?{}", v2.signer.sign("cache-upload", id)
+                )}),
+            )
+        }
+        "FinalizeCacheEntryUpload" => {
+            if !mode.can_save() {
+                return save_denied();
+            }
+            // Left out when 0 (`emitDefaultValues: false`).
+            let size = json_u64(&field("sizeBytes", "size_bytes")).unwrap_or(0);
+            let mut store = v2.store.lock().unwrap();
+            let Some(id) = store
+                .entries
+                .iter()
+                .find(|e| !e.complete && e.key == key && e.version == version)
+                .map(|e| e.id)
+            else {
+                return Response::json(
+                    200,
+                    json!({"ok": false, "message": format!("no pending upload for {key}")}),
+                );
+            };
+            let uploaded = std::fs::metadata(store.blob(id)).map_or(0, |m| m.len());
+            if uploaded != size {
+                // Stays pending; `gc` drops it after 5 minutes.
+                return Response::json(
+                    200,
+                    json!({"ok": false, "message": format!("uploaded {uploaded} bytes, expected {size}")}),
+                );
+            }
+            store.commit(id);
+            Response::json(200, json!({"ok": true, "entryId": id.to_string()}))
+        }
+        "GetCacheEntryDownloadURL" => {
+            // A miss is `ok: false`, logged by the toolkit at debug level.
+            let miss = || Response::json(200, json!({"ok": false}));
+            if !mode.can_restore() {
+                return miss();
+            }
+            let restore_keys = field("restoreKeys", "restore_keys");
+            // An empty key would prefix-match every entry.
+            let keys: Vec<String> = std::iter::once(key)
+                .chain(
+                    restore_keys
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|k| k.as_str().map(String::from)),
+                )
+                .filter(|k| !k.is_empty())
+                .collect();
+            let mut store = v2.store.lock().unwrap();
+            let Some((id, matched)) = store.lookup(&keys, version).map(|e| (e.id, e.key.clone()))
+            else {
+                return miss();
+            };
+            if let Some(e) = store.entries.iter_mut().find(|e| e.id == id) {
+                e.used = now();
+            }
+            store.save();
+            Response::json(
+                200,
+                json!({
+                    "ok": true, "matchedKey": matched,
+                    "signedDownloadUrl": format!(
+                        "http://{host}/cache-v2/download/{id}?{}", v2.signer.sign("cache-download", id)
+                    ),
+                }),
+            )
+        }
+        _ => twirp_error(404, "bad_route", method),
+    }
+}
+
+/// Uploads (Put Blob, or Put Block and Put Block List) to a pending entry and
+/// plain downloads of a complete one, at the URLs `cache_v2_twirp` signs. The
+/// signature alone authorizes them: only calls the job's cache-mode allows
+/// hand them out.
+fn cache_v2_blob(v2: &CacheV2, req: &Request) -> Response {
+    let parts: Vec<&str> = req.path.trim_start_matches('/').split('/').collect();
+    let (upload, id) = match (req.method.as_str(), parts.as_slice()) {
+        ("PUT", ["cache-v2", "upload", id]) => (true, id),
+        ("GET", ["cache-v2", "download", id]) => (false, id),
+        _ => return Response::empty(404),
+    };
+    let Ok(id) = id.parse::<u64>() else {
+        return Response::empty(400);
+    };
+    let kind = if upload {
+        "cache-upload"
+    } else {
+        "cache-download"
+    };
+    if !v2.signer.verify(kind, id, &req.query) {
+        return Response::empty(401);
+    }
+    let store = v2.store.lock().unwrap();
+    // Uploads go to a pending entry only, downloads come from a complete one.
+    if !store
+        .entries
+        .iter()
+        .any(|e| e.id == id && e.complete != upload)
+    {
+        return Response::empty(404);
+    }
+    let (blob, blocks) = (store.blob(id), store.blocks(id));
+    // Other jobs' cache calls go on while blob data is copied.
+    drop(store);
+    if !upload {
+        return Response::file(&blob, "application/octet-stream", None);
+    }
+    match write_block_blob(req, &blocks, &blob) {
+        Ok(_) => Response::empty(201),
+        Err(_) => Response::empty(400),
     }
 }
 
@@ -540,8 +787,8 @@ struct Artifact {
 struct ArtifactStore {
     dir: PathBuf,
     artifacts: Vec<Artifact>,
-    /// Per-run HMAC key for the v4 upload/download URLs.
-    key: Vec<u8>,
+    /// Signs the v4 upload/download URLs with a per-run key.
+    signer: UrlSigner,
     /// Which bearer tokens the Twirp and v3 calls must carry.
     auth: RuntimeAuth,
 }
@@ -609,26 +856,46 @@ impl RuntimeAuth {
 
     /// Whether `req` carries `Authorization: Bearer <a token this run issued>`.
     fn accepts(&self, req: &Request) -> bool {
-        let Some(token) = req
+        self.claims(req).is_some()
+    }
+
+    /// The claims of the token `req` carries: `None` when `accepts` refuses it,
+    /// the decoded payload of a token this run signed, and `Null` for the
+    /// caller's token, whose claims are neither readable nor trusted here.
+    fn claims(&self, req: &Request) -> Option<Value> {
+        let token = req
             .headers
             .get("authorization")
             .and_then(|h| h.split_once(' '))
             .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-            .map(|(_, t)| t.trim())
-        else {
-            return false;
-        };
+            .map(|(_, t)| t.trim())?;
         if let Some(t) = &self.from_env {
-            return same(token, t);
+            return same(token, t).then_some(Value::Null);
         }
-        token.rsplit_once('.').is_some_and(|(signed, sig)| {
-            same(sig, &base64url(&hmac_sha256(&self.key, signed.as_bytes())))
-        })
+        let (signed, sig) = token.rsplit_once('.')?;
+        if !same(sig, &base64url(&hmac_sha256(&self.key, signed.as_bytes()))) {
+            return None;
+        }
+        let (_, payload) = signed.split_once('.')?;
+        serde_json::from_slice(&base64url_decode(payload)?).ok()
     }
 }
 
-impl ArtifactStore {
-    /// `?expires=…&sig=…` for `/{kind}/{id}`.
+/// Signs URLs that authorize one blob operation for `SIGNED_URL_TTL_MS`: HMAC-SHA256
+/// over `<kind>/<id>/<expires>` with a per-run key.
+#[derive(Clone)]
+struct UrlSigner {
+    key: Vec<u8>,
+}
+
+impl UrlSigner {
+    fn new() -> UrlSigner {
+        UrlSigner {
+            key: hex::decode(random_token()).unwrap_or_default(),
+        }
+    }
+
+    /// `expires=…&sig=…` for `/{kind}/{id}`.
     fn sign(&self, kind: &str, id: u64) -> String {
         let expires = now() + SIGNED_URL_TTL_MS;
         let sig = hex::encode(hmac_sha256(
@@ -649,6 +916,51 @@ impl ArtifactStore {
         ));
         fresh && same(&want, sig)
     }
+}
+
+/// An Azure-blob-style upload of `req` to `file`: Put Blob (no `comp`), Put
+/// Block (`comp=block`, kept under `blocks`) or Put Block List
+/// (`comp=blocklist`, joining the listed blocks into `file` and removing
+/// `blocks`). Returns the size of `file` when it was written.
+fn write_block_blob(req: &Request, blocks: &Path, file: &Path) -> Result<Option<u64>> {
+    let create_parent = || -> Result<()> {
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Ok(())
+    };
+    Ok(match req.query.get("comp").map(String::as_str) {
+        Some("block") => {
+            let block = req.query.get("blockid").cloned().unwrap_or_default();
+            std::fs::create_dir_all(blocks)?;
+            std::fs::write(blocks.join(hex::encode(block)), &req.body)?;
+            None
+        }
+        Some("blocklist") => {
+            let xml = String::from_utf8_lossy(&req.body);
+            create_parent()?;
+            let mut out = std::fs::File::create(file)?;
+            let mut size = 0u64;
+            for chunk in xml.split('>').skip(1) {
+                let Some((block, _)) = chunk.split_once('<') else {
+                    continue;
+                };
+                let block = block.trim();
+                if block.is_empty() {
+                    continue;
+                }
+                let mut data = std::fs::File::open(blocks.join(hex::encode(block)))?;
+                size += std::io::copy(&mut data, &mut out)?;
+            }
+            let _ = std::fs::remove_dir_all(blocks);
+            Some(size)
+        }
+        _ => {
+            create_parent()?;
+            std::fs::write(file, &req.body)?;
+            Some(req.body.len() as u64)
+        }
+    })
 }
 
 impl ArtifactStore {
@@ -815,7 +1127,17 @@ fn artifact_v3(dir: &Path, host: &str, req: &Request) -> Response {
     }
 }
 
-fn artifact_handler(shared: Arc<Mutex<ArtifactStore>>, req: Request) -> Response {
+/// The artifact server; with the cache server on (`cache_v2`), it also serves
+/// the cache v2 routes, as both share `ACTIONS_RESULTS_URL`.
+fn artifact_handler(
+    shared: Arc<Mutex<ArtifactStore>>,
+    cache_v2: Option<&CacheV2>,
+    req: Request,
+) -> Response {
+    // The cache handler checks tokens and signatures itself.
+    if let Some(r) = cache_v2.and_then(|v2| cache_v2_route(v2, &req)) {
+        return r;
+    }
     let host = req.headers.get("host").cloned().unwrap_or_default();
     let mut store = shared.lock().unwrap();
     // Block uploads and downloads go to the signed URLs `twirp` hands out,
@@ -833,10 +1155,7 @@ fn artifact_handler(shared: Arc<Mutex<ArtifactStore>>, req: Request) -> Response
         drop(store);
         return artifact_v3(&dir, &host, &req);
     }
-    match req
-        .path
-        .strip_prefix("/twirp/github.actions.results.api.v1.ArtifactService/")
-    {
+    match req.path.strip_prefix(ARTIFACT_SERVICE) {
         Some(method) => twirp(&mut store, method, &req, &host),
         None => blob(&shared, store, &req),
     }
@@ -898,7 +1217,7 @@ fn twirp(store: &mut ArtifactStore, method: &str, req: &Request, host: &str) -> 
             let _ = std::fs::remove_dir_all(store.blocks_dir(id));
             Response::json(
                 200,
-                json!({"ok": true, "signedUploadUrl": format!("http://{host}/upload/{id}?{}", store.sign("upload", id))}),
+                json!({"ok": true, "signedUploadUrl": format!("http://{host}/upload/{id}?{}", store.signer.sign("upload", id))}),
             )
         }
         "FinalizeArtifact" => {
@@ -941,7 +1260,7 @@ fn twirp(store: &mut ArtifactStore, method: &str, req: &Request, host: &str) -> 
         "GetSignedArtifactURL" => match find(store) {
             Some(i) => Response::json(
                 200,
-                json!({"signedUrl": format!("http://{host}/download/{}?{}", store.artifacts[i].id, store.sign("download", store.artifacts[i].id))}),
+                json!({"signedUrl": format!("http://{host}/download/{}?{}", store.artifacts[i].id, store.signer.sign("download", store.artifacts[i].id))}),
             ),
             None => twirp_error(404, "not_found", "artifact not found"),
         },
@@ -969,7 +1288,7 @@ fn blob(
             let Ok(id) = id.parse::<u64>() else {
                 return Response::empty(400);
             };
-            if !store.verify("upload", id, &req.query) {
+            if !store.signer.verify("upload", id, &req.query) {
                 return Response::empty(401);
             }
             let Some(idx) = store.artifacts.iter().position(|a| a.id == id) else {
@@ -977,45 +1296,10 @@ fn blob(
             };
             let blocks = store.blocks_dir(id);
             let file = store.file(&store.artifacts[idx]);
-            let dir = store.dir.clone();
             // Blocks are written and joined while other jobs' calls go on; only
             // the size is set under the lock.
             drop(store);
-            let comp = req.query.get("comp").map(String::as_str);
-            let result: Result<Option<u64>> = (|| {
-                Ok(match comp {
-                    Some("block") => {
-                        let block = req.query.get("blockid").cloned().unwrap_or_default();
-                        std::fs::create_dir_all(&blocks)?;
-                        std::fs::write(blocks.join(hex::encode(block)), &req.body)?;
-                        None
-                    }
-                    Some("blocklist") => {
-                        let xml = String::from_utf8_lossy(&req.body);
-                        std::fs::create_dir_all(file.parent().unwrap_or(&dir))?;
-                        let mut out = std::fs::File::create(&file)?;
-                        let mut size = 0u64;
-                        for chunk in xml.split('>').skip(1) {
-                            let Some((block, _)) = chunk.split_once('<') else {
-                                continue;
-                            };
-                            let block = block.trim();
-                            if block.is_empty() {
-                                continue;
-                            }
-                            let mut data = std::fs::File::open(blocks.join(hex::encode(block)))?;
-                            size += std::io::copy(&mut data, &mut out)?;
-                        }
-                        let _ = std::fs::remove_dir_all(&blocks);
-                        Some(size)
-                    }
-                    _ => {
-                        std::fs::create_dir_all(file.parent().unwrap_or(&dir))?;
-                        std::fs::write(&file, &req.body)?;
-                        Some(req.body.len() as u64)
-                    }
-                })
-            })();
+            let result = write_block_blob(req, &blocks, &file);
             match result {
                 Ok(size) => {
                     if let Some(size) = size {
@@ -1033,7 +1317,7 @@ fn blob(
             let Ok(id) = id.parse::<u64>() else {
                 return Response::empty(400);
             };
-            if !store.verify("download", id, &req.query) {
+            if !store.signer.verify("download", id, &req.query) {
                 return Response::empty(401);
             }
             let Some(a) = store.artifacts.iter().find(|a| a.id == id) else {
@@ -1084,6 +1368,36 @@ fn base64url(data: &[u8]) -> String {
         .replace('/', "_")
 }
 
+/// Unpadded base64url, as in a JWT; `None` on any other character.
+fn base64url_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut bits, mut n) = (0u32, 0);
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        bits = (bits << 6 | u32::from(v)) & 0xffff;
+        n += 6;
+        if n >= 8 {
+            n -= 8;
+            out.push((bits >> n) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// The scheme and authority of `url`, without path, query or fragment.
+fn url_origin(url: &str) -> String {
+    let (scheme, rest) = url.split_once("://").unwrap_or(("http", url));
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    format!("{scheme}://{authority}")
+}
+
 impl Servers {
     pub fn start(
         cli: &crate::Cli,
@@ -1111,23 +1425,32 @@ impl Servers {
                     .filter(|v| !v.is_empty()),
             ),
         };
+        // Set when the cache server runs, for the artifact server to forward to.
+        let mut cache_v2 = None;
         if !cli.no_cache_server {
             let dir = cli
                 .cache_server_path
                 .clone()
                 .unwrap_or_else(|| base.join("cache"));
             let started = CacheStore::open(&dir).and_then(|store| {
-                let store = Arc::new(Mutex::new(store));
+                let v2 = CacheV2 {
+                    store: Arc::new(Mutex::new(store)),
+                    signer: UrlSigner::new(),
+                    auth: servers.auth.clone(),
+                };
                 let token = servers.cache_token.clone();
-                serve(
+                let handler = v2.clone();
+                let port = serve(
                     cli.cache_server_addr.as_deref().unwrap_or(default_addr),
                     cli.cache_server_port,
-                    Arc::new(move |req| cache_handler(store.clone(), &token, req)),
-                )
+                    Arc::new(move |req| cache_server(&handler, &token, req)),
+                )?;
+                Ok((port, v2))
             });
             match started {
-                Ok(p) => {
+                Ok((p, v2)) => {
                     servers.cache_port = Some(p);
+                    cache_v2 = Some(v2);
                     servers.cache_external = cli
                         .cache_server_external_url
                         .as_deref()
@@ -1143,13 +1466,13 @@ impl Servers {
             let store = Arc::new(Mutex::new(ArtifactStore {
                 dir: path.canonicalize()?,
                 artifacts: vec![],
-                key: hex::decode(random_token()).unwrap_or_default(),
+                signer: UrlSigner::new(),
                 auth: servers.auth.clone(),
             }));
             let p = serve(
                 cli.artifact_server_addr.as_deref().unwrap_or(default_addr),
                 cli.artifact_server_port,
-                Arc::new(move |req| artifact_handler(store.clone(), req)),
+                Arc::new(move |req| artifact_handler(store.clone(), cache_v2.as_ref(), req)),
             )?;
             servers.artifact_port = Some(p);
         }
@@ -1162,7 +1485,10 @@ impl Servers {
     }
 
     /// Environment variables for a job; `host` is how the job reaches this machine.
-    /// `cache_mode` is the job's `cache-mode` (`read`, `write`, `write-only`, `none`).
+    /// `cache_mode` is the job's `cache-mode` (`read`, `write`, `write-only`, `none`):
+    /// in `ACTIONS_CACHE_URL`'s path for the v1 API, and in the runtime token's
+    /// `runthrough_cache_mode` claim for the v2 API, whose client drops the path of
+    /// `ACTIONS_RESULTS_URL`.
     pub fn job_env(&self, host: &str, job: &str, cache_mode: CacheMode) -> Vec<(String, String)> {
         let mut env = Vec::new();
         if self.cache_port.is_none() && self.artifact_port.is_none() {
@@ -1176,6 +1502,7 @@ impl Servers {
             "ac": json!([{"Scope": "refs/heads/main", "Permission": 3}]).to_string(),
             "nbf": 0,
             "exp": 4_102_444_800u64,
+            "runthrough_cache_mode": cache_mode.name(),
         });
         env.push(("ACTIONS_RUNTIME_TOKEN".into(), self.auth.issue(&claims)));
         // As in act, values from the caller's environment win.
@@ -1187,6 +1514,21 @@ impl Servers {
                 None => format!("http://{host}:{p}/{path}"),
             };
             env.push(("ACTIONS_CACHE_URL".into(), url));
+            // The caller's token is the same for every job and carries no
+            // cache-mode, which v2 then takes as `write`: other jobs keep v1,
+            // which enforces their mode by URL.
+            if self.auth.from_env.is_none() || cache_mode == CacheMode::Write {
+                env.push(("ACTIONS_CACHE_SERVICE_V2".into(), "true".into()));
+            }
+            // v2 is served at the root of this origin (the toolkit drops any
+            // path); with the artifact server on, its port forwards v2 calls.
+            if self.artifact_port.is_none() {
+                let origin = match &self.cache_external {
+                    Some(u) => url_origin(u),
+                    None => format!("http://{host}:{p}"),
+                };
+                env.push(("ACTIONS_RESULTS_URL".into(), format!("{origin}/")));
+            }
         }
         if let Some(p) = self.artifact_port {
             env.push(("ACTIONS_RESULTS_URL".into(), format!("http://{host}:{p}/")));
@@ -1337,12 +1679,13 @@ mod tests {
         let store = Arc::new(Mutex::new(ArtifactStore {
             dir: dir.path().to_path_buf(),
             artifacts: vec![],
-            key: b"k".to_vec(),
+            signer: UrlSigner { key: b"k".to_vec() },
             auth,
         }));
         let call = |method: &str, path: &str, query: &str, body: &[u8]| {
             artifact_handler(
                 store.clone(),
+                None,
                 Request {
                     method: method.into(),
                     path: path.into(),
@@ -1414,12 +1757,13 @@ mod tests {
         let store = Arc::new(Mutex::new(ArtifactStore {
             dir: dir.path().to_path_buf(),
             artifacts: vec![],
-            key: b"k".to_vec(),
+            signer: UrlSigner { key: b"k".to_vec() },
             auth,
         }));
         let call = |method: &str, path: &str, auth: Option<&str>| {
             artifact_handler(
                 store.clone(),
+                None,
                 Request {
                     method: method.into(),
                     path: path.into(),
@@ -1551,12 +1895,7 @@ mod tests {
             hex::encode(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
-        let store = ArtifactStore {
-            dir: PathBuf::new(),
-            artifacts: vec![],
-            key: b"k".to_vec(),
-            auth: RuntimeAuth::new(None),
-        };
+        let store = UrlSigner { key: b"k".to_vec() };
         let q: HashMap<String, String> = store
             .sign("upload", 7)
             .split('&')
@@ -1647,5 +1986,658 @@ mod tests {
         let ac: Value = serde_json::from_str(claims["ac"].as_str().unwrap()).unwrap();
         assert_eq!(ac, json!([{"Scope": "refs/heads/main", "Permission": 3}]));
         assert!(claims["nbf"].is_number() && claims["exp"].is_number());
+    }
+
+    // ---------------------------------------------------------- cache v2
+
+    /// A cache v2 service over a store in `dir`.
+    fn v2_service(dir: &Path, auth: RuntimeAuth) -> CacheV2 {
+        CacheV2 {
+            store: Arc::new(Mutex::new(CacheStore::open(dir).unwrap())),
+            signer: UrlSigner::new(),
+            auth,
+        }
+    }
+
+    /// A Twirp `CacheService` call to `host: h:1`; its status and JSON body.
+    fn v2_twirp(
+        handler: &dyn Fn(Request) -> Response,
+        token: Option<&str>,
+        method: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        let mut headers = HashMap::from([("host".to_string(), "h:1".to_string())]);
+        if let Some(t) = token {
+            headers.insert("authorization".into(), format!("Bearer {t}"));
+        }
+        let r = handler(Request {
+            method: "POST".into(),
+            path: format!("{CACHE_SERVICE}{method}"),
+            query: HashMap::new(),
+            headers,
+            body: body.to_string().into_bytes(),
+        });
+        (r.status, serde_json::from_slice(&r.body).unwrap())
+    }
+
+    /// A request to `url` (on `http://h:1`) with `extra` appended to its query,
+    /// as the Azure SDK does.
+    fn url_req(
+        method: &str,
+        url: &str,
+        extra: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Request {
+        let rest = url.strip_prefix("http://h:1").unwrap();
+        let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+        Request {
+            method: method.into(),
+            path: path.into(),
+            query: query
+                .split('&')
+                .chain(extra.split('&'))
+                .filter_map(|kv| kv.split_once('='))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: body.to_vec(),
+        }
+    }
+
+    /// The response as sent: its header block and its body.
+    fn on_wire(resp: &Response) -> (String, Vec<u8>) {
+        let mut wire = Vec::new();
+        write_response(&mut wire, resp).unwrap();
+        let end = wire.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        (
+            String::from_utf8_lossy(&wire[..end]).into_owned(),
+            wire[end..].to_vec(),
+        )
+    }
+
+    /// Create → Put Blob → Finalize; the signed upload URL.
+    fn v2_save(h: &dyn Fn(Request) -> Response, token: &str, key: &str, data: &[u8]) -> String {
+        let (_, created) = v2_twirp(
+            h,
+            Some(token),
+            "CreateCacheEntry",
+            json!({"key": key, "version": "v"}),
+        );
+        assert_eq!(created["ok"], true, "{created}");
+        let url = created["signedUploadUrl"].as_str().unwrap().to_string();
+        let put = h(url_req(
+            "PUT",
+            &url,
+            "",
+            &[("x-ms-blob-type", "BlockBlob")],
+            data,
+        ));
+        assert_eq!(put.status, 201);
+        let (_, done) = v2_twirp(
+            h,
+            Some(token),
+            "FinalizeCacheEntryUpload",
+            json!({"key": key, "version": "v", "size_bytes": data.len().to_string()}),
+        );
+        assert_eq!(done["ok"], true, "{done}");
+        url
+    }
+
+    /// GetCacheEntryDownloadURL then GET: the matched key and the bytes.
+    fn v2_restore(
+        h: &dyn Fn(Request) -> Response,
+        token: &str,
+        key: &str,
+        restore_keys: &[&str],
+    ) -> Option<(String, Vec<u8>)> {
+        let (status, found) = v2_twirp(
+            h,
+            Some(token),
+            "GetCacheEntryDownloadURL",
+            json!({"key": key, "restore_keys": restore_keys, "version": "v"}),
+        );
+        assert_eq!(status, 200);
+        if found["ok"] != true {
+            return None;
+        }
+        let resp = h(url_req(
+            "GET",
+            found["signedDownloadUrl"].as_str().unwrap(),
+            "",
+            &[],
+            b"",
+        ));
+        assert_eq!(resp.status, 200);
+        let (head, body) = on_wire(&resp);
+        assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())));
+        Some((found["matchedKey"].as_str().unwrap().to_string(), body))
+    }
+
+    #[test]
+    fn cache_v2_save_then_restore_returns_the_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let (status, created) = v2_twirp(
+            &h,
+            Some(&token),
+            "CreateCacheEntry",
+            json!({"key": "Deps-Linux", "version": "v"}),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(created["ok"], true);
+        let url = created["signedUploadUrl"].as_str().unwrap();
+        assert!(
+            url.starts_with("http://h:1/cache-v2/upload/1?expires="),
+            "{url}"
+        );
+        let put = h(url_req(
+            "PUT",
+            url,
+            "",
+            &[("x-ms-blob-type", "BlockBlob")],
+            b"cached bytes",
+        ));
+        assert_eq!(put.status, 201);
+        let (_, done) = v2_twirp(
+            &h,
+            Some(&token),
+            "FinalizeCacheEntryUpload",
+            json!({"key": "Deps-Linux", "version": "v", "size_bytes": "12"}),
+        );
+        assert_eq!(done, json!({"ok": true, "entryId": "1"}));
+        assert_eq!(
+            v2_restore(&h, &token, "Deps-Linux", &[]),
+            Some(("deps-linux".to_string(), b"cached bytes".to_vec()))
+        );
+        // A second save of the same key and version is a non-retryable conflict.
+        let (status, again) = v2_twirp(
+            &h,
+            Some(&token),
+            "CreateCacheEntry",
+            json!({"key": "deps-linux", "version": "v"}),
+        );
+        assert_eq!(status, 409);
+        assert_eq!(again["code"], "already_exists");
+        let (status, unknown) = v2_twirp(&h, Some(&token), "DeleteCacheEntry", json!({}));
+        assert_eq!((status, unknown["code"].as_str()), (404, Some("bad_route")));
+    }
+
+    #[test]
+    fn cache_v2_block_upload_joins_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let (_, created) = v2_twirp(
+            &h,
+            Some(&token),
+            "CreateCacheEntry",
+            json!({"key": "big", "version": "v"}),
+        );
+        let url = created["signedUploadUrl"].as_str().unwrap();
+        for (block, data) in [("AAAB", b"world".as_slice()), ("AAAA", b"hello ")] {
+            let extra = format!("comp=block&blockid={block}");
+            assert_eq!(h(url_req("PUT", url, &extra, &[], data)).status, 201);
+        }
+        let blocks = dir.path().join("blocks").join("1");
+        assert!(blocks.is_dir());
+        let list = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><BlockList><Latest>AAAA</Latest><Latest>AAAB</Latest></BlockList>"#;
+        assert_eq!(
+            h(url_req("PUT", url, "comp=blocklist", &[], list)).status,
+            201
+        );
+        assert!(!blocks.exists());
+        let (_, done) = v2_twirp(
+            &h,
+            Some(&token),
+            "FinalizeCacheEntryUpload",
+            json!({"key": "big", "version": "v", "sizeBytes": 11}),
+        );
+        assert_eq!(done["ok"], true);
+        assert_eq!(
+            v2_restore(&h, &token, "big", &[]).unwrap().1,
+            b"hello world"
+        );
+    }
+
+    #[test]
+    fn cache_v2_finalize_checks_the_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let (_, created) = v2_twirp(
+            &h,
+            Some(&token),
+            "CreateCacheEntry",
+            json!({"key": "k", "version": "v"}),
+        );
+        let url = created["signedUploadUrl"].as_str().unwrap();
+        assert_eq!(h(url_req("PUT", url, "", &[], b"short")).status, 201);
+        let (status, done) = v2_twirp(
+            &h,
+            Some(&token),
+            "FinalizeCacheEntryUpload",
+            json!({"key": "k", "version": "v", "size_bytes": "6"}),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            done,
+            json!({"ok": false, "message": "uploaded 5 bytes, expected 6"})
+        );
+        assert_eq!(v2_restore(&h, &token, "k", &[]), None);
+        assert!(!v2.store.lock().unwrap().entries[0].complete);
+        let (_, none) = v2_twirp(
+            &h,
+            Some(&token),
+            "FinalizeCacheEntryUpload",
+            json!({"key": "other", "version": "v", "size_bytes": "5"}),
+        );
+        assert_eq!(
+            none,
+            json!({"ok": false, "message": "no pending upload for other"})
+        );
+    }
+
+    #[test]
+    fn cache_entries_are_shared_between_v1_and_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let v1 =
+            |method: &str, rest: &str, query: &[(&str, &str)], range: Option<&str>, body: &[u8]| {
+                let mut headers = HashMap::from([("host".to_string(), "h:1".to_string())]);
+                if let Some(r) = range {
+                    headers.insert("content-range".into(), r.into());
+                }
+                h(Request {
+                    method: method.into(),
+                    path: format!("/tok/_apis/artifactcache/{rest}"),
+                    query: query
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                    headers,
+                    body: body.to_vec(),
+                })
+            };
+        // Saved through v1, restored through v2 with an upper-case restore key.
+        let reserve = json!({"key": "Shared-Key", "version": "v"}).to_string();
+        let created = v1("POST", "caches", &[], None, reserve.as_bytes());
+        assert_eq!(created.status, 201);
+        let id = serde_json::from_slice::<Value>(&created.body).unwrap()["cacheId"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            v1(
+                "PATCH",
+                &format!("caches/{id}"),
+                &[],
+                Some("bytes 0-4/*"),
+                b"hello"
+            )
+            .status,
+            204
+        );
+        assert_eq!(
+            v1("POST", &format!("caches/{id}"), &[], None, b"").status,
+            204
+        );
+        assert_eq!(
+            v2_restore(&h, &token, "nope", &["SHARED-"]),
+            Some(("shared-key".to_string(), b"hello".to_vec()))
+        );
+        // Saved through v2, restored through v1.
+        v2_save(&h, &token, "From-V2", b"world");
+        let found = v1(
+            "GET",
+            "cache",
+            &[("keys", "from-v2"), ("version", "v")],
+            None,
+            b"",
+        );
+        assert_eq!(found.status, 200);
+        let found: Value = serde_json::from_slice(&found.body).unwrap();
+        assert_eq!(found["cacheKey"], "from-v2");
+        let location = found["archiveLocation"].as_str().unwrap();
+        let rest = location
+            .strip_prefix("http://h:1/tok/_apis/artifactcache/")
+            .unwrap();
+        assert_eq!(on_wire(&v1("GET", rest, &[], None, b"")).1, b"world");
+        // The v2 entry is an ordinary record of `index.json`.
+        let reopened = CacheStore::open(dir.path()).unwrap();
+        let e = reopened.lookup(&["from-v2".to_string()], "v").unwrap();
+        assert_eq!(std::fs::read(reopened.blob(e.id)).unwrap(), b"world");
+        // A block upload abandoned for over 5 minutes goes, blocks and all.
+        let (_, created) = v2_twirp(
+            &h,
+            Some(&token),
+            "CreateCacheEntry",
+            json!({"key": "abandoned", "version": "v"}),
+        );
+        let url = created["signedUploadUrl"].as_str().unwrap();
+        assert_eq!(
+            h(url_req("PUT", url, "comp=block&blockid=AAAA", &[], b"x")).status,
+            201
+        );
+        let mut store = v2.store.lock().unwrap();
+        let id = store
+            .entries
+            .iter()
+            .find(|e| e.key == "abandoned")
+            .unwrap()
+            .id;
+        assert!(store.blocks(id).is_dir());
+        for e in store.entries.iter_mut().filter(|e| e.id == id) {
+            e.created = now() - 10 * MINUTE_MS;
+            e.used = e.created;
+        }
+        store.gc(now());
+        assert!(store.entries.iter().all(|e| e.id != id));
+        assert!(!store.blocks(id).exists() && !store.blob(id).exists());
+    }
+
+    #[test]
+    fn cache_mode_limits_v2_restore_and_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let v2 = v2_service(dir.path(), RuntimeAuth::new(None));
+        let servers = Servers {
+            cache_port: Some(1),
+            cache_token: "tok".into(),
+            cache_external: None,
+            artifact_port: None,
+            run_id: "7".into(),
+            auth: v2.auth.clone(),
+        };
+        // The token `job_env` issues for a job of that mode.
+        let token = |mode| {
+            servers
+                .job_env("h", "j", mode)
+                .into_iter()
+                .find(|(k, _)| k == "ACTIONS_RUNTIME_TOKEN")
+                .unwrap()
+                .1
+        };
+        let h = |req| cache_server(&v2, "tok", req);
+        v2_save(&h, &token(CacheMode::Write), "seed", b"data");
+        for (mode, restore, save) in [
+            (CacheMode::Write, true, true),
+            (CacheMode::Read, true, false),
+            (CacheMode::WriteOnly, false, true),
+            (CacheMode::Disabled, false, false),
+        ] {
+            let t = token(mode);
+            let name = mode.name();
+            assert_eq!(v2_restore(&h, &t, "seed", &[]).is_some(), restore, "{name}");
+            let key = format!("new-{name}");
+            let (status, created) = v2_twirp(
+                &h,
+                Some(&t),
+                "CreateCacheEntry",
+                json!({"key": key, "version": "v"}),
+            );
+            assert_eq!(status, 200);
+            // Size 0 is left out, as the toolkit's encoder does.
+            let (_, done) = v2_twirp(
+                &h,
+                Some(&t),
+                "FinalizeCacheEntryUpload",
+                json!({"key": key, "version": "v"}),
+            );
+            if save {
+                assert_eq!(created["ok"], true, "{name}");
+                assert!(created["signedUploadUrl"].is_string());
+                assert_eq!(done["ok"], true, "{name}");
+            } else {
+                let refused = json!({"ok": false, "message": format!("cache-mode {name} does not allow saving")});
+                assert_eq!(created, refused);
+                assert_eq!(done, refused);
+            }
+        }
+        // A token without the claim (the caller's) is `write`.
+        let plain = v2.auth.issue(&json!({}));
+        assert!(v2_restore(&h, &plain, "seed", &[]).is_some());
+    }
+
+    #[test]
+    fn cache_v2_needs_a_runtime_token_and_signed_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let other_run = RuntimeAuth::new(None).issue(&json!({}));
+        let (head, payload) = token.rsplit_once('.').unwrap().0.split_once('.').unwrap();
+        let forged = format!("{head}.{payload}.runthrough");
+        for bad in [
+            None,
+            Some(other_run.as_str()),
+            Some("garbage"),
+            Some(forged.as_str()),
+        ] {
+            for method in ["CreateCacheEntry", "GetCacheEntryDownloadURL"] {
+                let (status, body) = v2_twirp(&h, bad, method, json!({"key": "k", "version": "v"}));
+                assert_eq!(status, 401, "{bad:?}");
+                assert_eq!(
+                    body,
+                    json!({"code": "unauthenticated", "msg": "missing or invalid ACTIONS_RUNTIME_TOKEN"})
+                );
+            }
+        }
+        assert!(v2.store.lock().unwrap().entries.is_empty());
+
+        // The caller's own token works, as `write`.
+        let caller_dir = tempfile::tempdir().unwrap();
+        let caller = v2_service(caller_dir.path(), RuntimeAuth::new(Some("ghs_real".into())));
+        let hc = |req| cache_server(&caller, "tok", req);
+        assert_eq!(
+            v2_twirp(&hc, Some(&token), "CreateCacheEntry", json!({"key": "k"})).0,
+            401
+        );
+        v2_save(&hc, "ghs_real", "k", b"x");
+        assert!(v2_restore(&hc, "ghs_real", "k", &[]).is_some());
+
+        // Signed URLs: only this server's signature, for that kind and entry, in time.
+        let (_, created) = v2_twirp(
+            &h,
+            Some(&token),
+            "CreateCacheEntry",
+            json!({"key": "k", "version": "v"}),
+        );
+        let url = created["signedUploadUrl"].as_str().unwrap();
+        let (base, query) = url.split_once('?').unwrap();
+        let sig = query.split_once("&sig=").unwrap().1;
+        let flipped = format!(
+            "{}{}",
+            &sig[..sig.len() - 1],
+            if sig.ends_with('0') { '1' } else { '0' }
+        );
+        let past = now() - 1;
+        let expired = hex::encode(hmac_sha256(
+            &v2.signer.key,
+            format!("cache-upload/1/{past}").as_bytes(),
+        ));
+        for query in [
+            query.replace(sig, &flipped),
+            format!("expires={past}&sig={expired}"),
+            v2.signer.sign("upload", 1),
+            v2.signer.sign("cache-download", 1),
+            UrlSigner::new().sign("cache-upload", 1),
+            String::new(),
+        ] {
+            let put = h(url_req("PUT", &format!("{base}?{query}"), "", &[], b"evil"));
+            assert_eq!(put.status, 401, "{query}");
+        }
+        // An artifact server's URL, with its own key and kind.
+        let artifact_url = UrlSigner::new().sign("download", 1);
+        let get = h(url_req(
+            "GET",
+            &format!("http://h:1/cache-v2/download/1?{artifact_url}"),
+            "",
+            &[],
+            b"",
+        ));
+        assert_eq!(get.status, 401);
+        let get = h(url_req(
+            "GET",
+            &url.replace("/upload/", "/download/"),
+            "",
+            &[],
+            b"",
+        ));
+        assert_eq!(get.status, 401);
+        // The URL itself still works, and only for its own entry.
+        assert_eq!(h(url_req("PUT", url, "", &[], b"good")).status, 201);
+        let other = url.replace("/upload/1?", "/upload/2?");
+        assert_eq!(h(url_req("PUT", &other, "", &[], b"evil")).status, 401);
+    }
+
+    #[test]
+    fn job_env_selects_v2_with_the_cache_server() {
+        let servers = |cache: bool, artifact: bool, external: Option<&str>, caller: bool| Servers {
+            cache_port: cache.then_some(10),
+            cache_token: "tok".into(),
+            cache_external: external.map(String::from),
+            artifact_port: artifact.then_some(20),
+            run_id: "7".into(),
+            auth: RuntimeAuth::new(caller.then(|| "ghs_real".to_string())),
+        };
+        let env = |s: &Servers, mode| {
+            let env = s.job_env("h", "j", mode);
+            let results = env
+                .iter()
+                .filter(|(k, _)| k == "ACTIONS_RESULTS_URL")
+                .count();
+            assert!(results <= 1, "{env:?}");
+            env.into_iter().collect::<HashMap<String, String>>()
+        };
+        let get = |e: &HashMap<String, String>, k: &str| e.get(k).cloned();
+        let s = |v: &str| Some(v.to_string());
+
+        let e = env(&servers(true, false, None, false), CacheMode::Write);
+        assert_eq!(get(&e, "ACTIONS_CACHE_URL"), s("http://h:10/tok/"));
+        assert_eq!(get(&e, "ACTIONS_CACHE_SERVICE_V2"), s("true"));
+        assert_eq!(get(&e, "ACTIONS_RESULTS_URL"), s("http://h:10/"));
+        assert_eq!(get(&e, "ACTIONS_RUNTIME_URL"), None);
+        assert!(e.contains_key("ACTIONS_RUNTIME_TOKEN"));
+
+        let e = env(&servers(true, true, None, false), CacheMode::Write);
+        assert_eq!(get(&e, "ACTIONS_CACHE_URL"), s("http://h:10/tok/"));
+        assert_eq!(get(&e, "ACTIONS_CACHE_SERVICE_V2"), s("true"));
+        assert_eq!(get(&e, "ACTIONS_RESULTS_URL"), s("http://h:20/"));
+        assert!(e.contains_key("ACTIONS_RUNTIME_URL") && e.contains_key("ACTIONS_RUNTIME_TOKEN"));
+
+        let e = env(&servers(false, true, None, false), CacheMode::Write);
+        assert_eq!(get(&e, "ACTIONS_CACHE_URL"), None);
+        assert_eq!(get(&e, "ACTIONS_CACHE_SERVICE_V2"), None);
+        assert_eq!(get(&e, "ACTIONS_RESULTS_URL"), s("http://h:20/"));
+        assert!(e.contains_key("ACTIONS_RUNTIME_URL") && e.contains_key("ACTIONS_RUNTIME_TOKEN"));
+
+        assert!(env(&servers(false, false, None, false), CacheMode::Write).is_empty());
+
+        // `Servers::start` keeps the external URL without its trailing slash.
+        let e = env(
+            &servers(true, false, Some("https://proxy.example/prefix"), false),
+            CacheMode::Read,
+        );
+        assert_eq!(
+            get(&e, "ACTIONS_CACHE_URL"),
+            s("https://proxy.example/prefix/tok/read/")
+        );
+        assert_eq!(get(&e, "ACTIONS_CACHE_SERVICE_V2"), s("true"));
+        assert_eq!(get(&e, "ACTIONS_RESULTS_URL"), s("https://proxy.example/"));
+        assert_eq!(
+            url_origin("https://proxy.example/prefix/"),
+            "https://proxy.example"
+        );
+        assert_eq!(url_origin("http://10.0.0.1:8080?x"), "http://10.0.0.1:8080");
+        // The mode travels in the token the run signs.
+        let token = get(&e, "ACTIONS_RUNTIME_TOKEN").unwrap();
+        let claims: Value =
+            serde_json::from_slice(&base64url_decode(token.split('.').nth(1).unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(claims["runthrough_cache_mode"], "read");
+
+        // With the caller's token, only `write` jobs get v2.
+        let caller = servers(true, false, None, true);
+        let e = env(&caller, CacheMode::Read);
+        assert_eq!(get(&e, "ACTIONS_RUNTIME_TOKEN"), s("ghs_real"));
+        assert_eq!(get(&e, "ACTIONS_CACHE_SERVICE_V2"), None);
+        assert_eq!(get(&e, "ACTIONS_CACHE_URL"), s("http://h:10/tok/read/"));
+        assert_eq!(get(&e, "ACTIONS_RESULTS_URL"), s("http://h:10/"));
+        let e = env(&caller, CacheMode::Write);
+        assert_eq!(get(&e, "ACTIONS_CACHE_SERVICE_V2"), s("true"));
+    }
+
+    #[test]
+    fn artifact_port_forwards_cache_v2() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(cache_dir.path(), auth.clone());
+        let store = Arc::new(Mutex::new(ArtifactStore {
+            dir: artifact_dir.path().to_path_buf(),
+            artifacts: vec![],
+            signer: UrlSigner::new(),
+            auth,
+        }));
+        let with = |req| artifact_handler(store.clone(), Some(&v2), req);
+        v2_save(&with, &token, "k", b"through the artifact port");
+        assert_eq!(
+            v2_restore(&with, &token, "k", &[]).unwrap().1,
+            b"through the artifact port"
+        );
+        // Its own API is still there.
+        let (status, _) = {
+            let r = with(Request {
+                method: "POST".into(),
+                path: format!("{ARTIFACT_SERVICE}ListArtifacts"),
+                query: HashMap::new(),
+                headers: HashMap::from([("authorization".to_string(), format!("Bearer {token}"))]),
+                body: json!({"workflow_run_backend_id": "r"})
+                    .to_string()
+                    .into_bytes(),
+            });
+            (r.status, r.body)
+        };
+        assert_eq!(status, 200);
+        // Without the cache server, a CacheService call gets what it got before.
+        let without = |req| artifact_handler(store.clone(), None, req);
+        let r = without(Request {
+            method: "POST".into(),
+            path: format!("{CACHE_SERVICE}CreateCacheEntry"),
+            query: HashMap::new(),
+            headers: HashMap::from([("authorization".to_string(), format!("Bearer {token}"))]),
+            body: json!({"key": "k2", "version": "v"})
+                .to_string()
+                .into_bytes(),
+        });
+        assert_eq!((r.status, r.body.is_empty()), (404, true));
+        // The cache port points artifact calls at `--artifact-server-path`.
+        let h = |req| cache_server(&v2, "tok", req);
+        let r = h(Request {
+            method: "POST".into(),
+            path: format!("{ARTIFACT_SERVICE}CreateArtifact"),
+            query: HashMap::new(),
+            headers: HashMap::from([("authorization".to_string(), format!("Bearer {token}"))]),
+            body: b"{}".to_vec(),
+        });
+        assert_eq!(r.status, 404);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&r.body).unwrap(),
+            json!({"code": "bad_route", "msg": "the artifact server is off: run with --artifact-server-path"})
+        );
     }
 }
