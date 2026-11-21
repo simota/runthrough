@@ -269,6 +269,16 @@ struct CacheStore {
     dir: PathBuf,
     entries: Vec<CacheEntry>,
     next_id: u64,
+    /// Who reserved each pending v2 entry (the claims of its runtime token), so
+    /// a finalize commits only the caller's own reservation. Not persisted: after
+    /// a restart the signing keys are new, so those uploads cannot go on anyway.
+    owners: HashMap<u64, String>,
+}
+
+/// Whether `e` was reserved, uploaded to or restored in the last 5 minutes:
+/// a pending entry used longer ago is abandoned.
+fn recently_used(e: &CacheEntry, now: u64) -> bool {
+    now.saturating_sub(e.used.max(e.created)) < 5 * MINUTE_MS
 }
 
 impl CacheStore {
@@ -284,6 +294,7 @@ impl CacheStore {
             dir: dir.to_path_buf(),
             entries,
             next_id,
+            owners: HashMap::new(),
         };
         store.gc(now());
         Ok(store)
@@ -293,7 +304,6 @@ impl CacheStore {
     /// days or created over 30 days ago, and older entries of the same key and
     /// version (unless used in the last 5 minutes).
     fn gc(&mut self, now: u64) {
-        let last_used = |e: &CacheEntry| e.used.max(e.created);
         let newest: std::collections::HashMap<(String, String), u64> = self
             .entries
             .iter()
@@ -308,9 +318,9 @@ impl CacheStore {
         let (keep, drop): (Vec<CacheEntry>, Vec<CacheEntry>) = std::mem::take(&mut self.entries)
             .into_iter()
             .partition(|e| {
-                let recent = now.saturating_sub(last_used(e)) < 5 * MINUTE_MS;
+                let recent = recently_used(e, now);
                 let abandoned = !e.complete && !recent;
-                let stale = now.saturating_sub(last_used(e)) > 7 * DAY_MS
+                let stale = now.saturating_sub(e.used.max(e.created)) > 7 * DAY_MS
                     || now.saturating_sub(e.created) > 30 * DAY_MS;
                 let superseded = e.complete
                     && newest.get(&(e.key.clone(), e.version.clone())) != Some(&e.id)
@@ -318,14 +328,21 @@ impl CacheStore {
                 !(abandoned || stale || superseded)
             });
         for e in &drop {
-            let _ = std::fs::remove_file(self.blob(e.id));
-            // A v2 block upload that never got its block list.
-            let _ = std::fs::remove_dir_all(self.blocks(e.id));
+            self.remove_files(e.id);
         }
         self.entries = keep;
         if !drop.is_empty() {
             self.save();
         }
+    }
+
+    /// Everything stored for entry `id`: its blob and, for a v2 upload that
+    /// never finished, its staging file and blocks.
+    fn remove_files(&mut self, id: u64) {
+        let _ = std::fs::remove_file(self.blob(id));
+        let _ = std::fs::remove_file(self.staging(id));
+        let _ = std::fs::remove_dir_all(self.blocks(id));
+        self.owners.remove(&id);
     }
 
     fn save(&self) {
@@ -338,36 +355,69 @@ impl CacheStore {
         self.dir.join("blobs").join(id.to_string())
     }
 
-    /// Where a v2 upload's blocks wait for their block list.
+    /// Where a v2 upload's blocks wait for their block list, until the entry is
+    /// finalized or dropped.
     fn blocks(&self, id: u64) -> PathBuf {
         self.dir.join("blocks").join(id.to_string())
     }
 
-    /// A pending entry for `key` (lowercased) and `version` with an empty blob,
-    /// replacing pending ones of the same key and version; `None` when a complete
-    /// one exists. Shared by the v1 and v2 APIs.
-    fn reserve(&mut self, key: &str, version: &str) -> Option<u64> {
+    /// Where a v2 upload lands (renamed into place by `CacheV2::place`); only
+    /// a finalize publishes it as the blob, so a late upload cannot change a
+    /// committed entry.
+    fn staging(&self, id: u64) -> PathBuf {
+        self.dir.join("blobs").join(format!("{id}.upload"))
+    }
+
+    /// A pending entry for `key` (lowercased) and `version`, recorded in
+    /// `index.json` so a restart can still collect it; `None` when a complete
+    /// one exists. Shared by the v1 and v2 APIs:
+    ///
+    /// - v1 (`owner` is `None`) replaces any pending entry of that key and
+    ///   version, and its data goes straight into the (empty) blob;
+    /// - v2 (`owner` is the caller's token claims) refuses while another
+    ///   reservation of them is still in use, replaces only an abandoned one,
+    ///   and also gets an empty staging file, which its finalize publishes
+    ///   over the blob.
+    ///
+    /// A replaced entry's files go with it.
+    fn reserve(&mut self, key: &str, version: &str, owner: Option<&str>) -> Option<u64> {
         let key = key.to_lowercase();
+        let now = now();
+        let same = |e: &CacheEntry| e.key == key && e.version == version;
         if self
             .entries
             .iter()
-            .any(|e| e.complete && e.key == key && e.version == version)
+            .filter(|e| same(e))
+            .any(|e| e.complete || (owner.is_some() && recently_used(e, now)))
         {
             return None;
         }
+        let replaced: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|e| same(e))
+            .map(|e| e.id)
+            .collect();
+        self.entries.retain(|e| !same(e));
+        for old in replaced {
+            self.remove_files(old);
+        }
         let id = self.next_id;
         self.next_id += 1;
-        self.entries
-            .retain(|e| !(e.key == key && e.version == version));
         self.entries.push(CacheEntry {
             id,
             key,
             version: version.to_string(),
             complete: false,
-            created: now(),
-            used: now(),
+            created: now,
+            used: now,
         });
         let _ = std::fs::write(self.blob(id), b"");
+        if let Some(owner) = owner {
+            let _ = std::fs::write(self.staging(id), b"");
+            self.owners.insert(id, owner.to_string());
+        }
+        self.save();
         Some(id)
     }
 
@@ -378,6 +428,8 @@ impl CacheStore {
         };
         e.complete = true;
         e.used = now();
+        self.owners.remove(&id);
+        let _ = std::fs::remove_dir_all(self.blocks(id));
         self.save();
         self.gc(now());
         true
@@ -502,7 +554,7 @@ fn cache_handler(store: Arc<Mutex<CacheStore>>, token: &str, req: Request) -> Re
         ("POST", ["caches"]) => {
             let key = body["key"].as_str().unwrap_or_default();
             let version = body["version"].as_str().unwrap_or_default();
-            match store.reserve(key, version) {
+            match store.reserve(key, version, None) {
                 Some(id) => Response::json(201, json!({"cacheId": id})),
                 None => Response::json(409, json!({"message": "cache already exists"})),
             }
@@ -572,13 +624,20 @@ struct CacheV2 {
     /// Signs the `/cache-v2/` blob URLs; not the artifact server's key.
     signer: UrlSigner,
     auth: RuntimeAuth,
+    /// The origin of `--cache-server-external-url`: jobs reach the cache port
+    /// there, so its signed blob URLs name it instead of `http://<Host>`.
+    external: Option<String>,
 }
 
 /// The cache server: v2 routes, a pointer to `--artifact-server-path` for
 /// artifact calls (`ACTIONS_RESULTS_URL` names this port when the artifact
 /// server is off), and the v1 API under the per-run `token` prefix.
 fn cache_server(v2: &CacheV2, token: &str, req: Request) -> Response {
-    if let Some(r) = cache_v2_route(v2, &req) {
+    let origin = match &v2.external {
+        Some(o) => o.clone(),
+        None => format!("http://{}", host_header(&req)),
+    };
+    if let Some(r) = cache_v2_route(v2, &req, &origin) {
         return r;
     }
     if req.path.starts_with(ARTIFACT_SERVICE) {
@@ -591,11 +650,17 @@ fn cache_server(v2: &CacheV2, token: &str, req: Request) -> Response {
     cache_handler(v2.store.clone(), token, req)
 }
 
+/// The request's `Host` header, or empty.
+fn host_header(req: &Request) -> String {
+    req.headers.get("host").cloned().unwrap_or_default()
+}
+
 /// The v2 routes (`/twirp/…CacheService/<method>`, `/cache-v2/…`); `None` for
-/// any other path.
-fn cache_v2_route(v2: &CacheV2, req: &Request) -> Option<Response> {
+/// any other path. `origin` is where the job reaches this server, for the
+/// signed blob URLs.
+fn cache_v2_route(v2: &CacheV2, req: &Request, origin: &str) -> Option<Response> {
     if let Some(method) = req.path.strip_prefix(CACHE_SERVICE) {
-        return Some(cache_v2_twirp(v2, method, req));
+        return Some(cache_v2_twirp(v2, method, req, origin));
     }
     req.path
         .starts_with("/cache-v2/")
@@ -603,8 +668,12 @@ fn cache_v2_route(v2: &CacheV2, req: &Request) -> Option<Response> {
 }
 
 /// The cache service v2 Twirp calls. Every answer has a JSON body: the toolkit
-/// retries any other for about 20 seconds.
-fn cache_v2_twirp(v2: &CacheV2, method: &str, req: &Request) -> Response {
+/// retries any other for about 20 seconds. Responses use the proto field
+/// names: the toolkit masks the signatures in `signed_upload_url` and
+/// `signed_download_url` only, before it logs the body at debug level. No
+/// message repeats the key: the toolkit takes any `msg` containing
+/// `insufficient usage` for a quota error.
+fn cache_v2_twirp(v2: &CacheV2, method: &str, req: &Request, origin: &str) -> Response {
     let Some(claims) = v2.auth.claims(req) else {
         return twirp_error(
             401,
@@ -612,16 +681,25 @@ fn cache_v2_twirp(v2: &CacheV2, method: &str, req: &Request) -> Response {
             "missing or invalid ACTIONS_RUNTIME_TOKEN",
         );
     };
-    if req.method != "POST" {
+    let known = [
+        "CreateCacheEntry",
+        "FinalizeCacheEntryUpload",
+        "GetCacheEntryDownloadURL",
+    ];
+    if req.method != "POST" || !known.contains(&method) {
         return twirp_error(404, "bad_route", method);
     }
+    let Ok(Value::Object(body)) = serde_json::from_slice::<Value>(&req.body) else {
+        return twirp_error(400, "malformed", "the request body is not a JSON object");
+    };
     // The path cannot carry the job's cache-mode (the toolkit drops it), so the
     // token does; the caller's own token has no such claim and means `write`.
     let mode = claims["runthrough_cache_mode"]
         .as_str()
         .and_then(CacheMode::parse)
         .unwrap_or(CacheMode::Write);
-    let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+    // The job a reservation belongs to: tokens this run signs name it in `scp`.
+    let owner = claims.to_string();
     // The toolkit sends proto field names; protobuf JSON also allows lowerCamelCase.
     let field = |camel: &str, snake: &str| -> Value {
         body.get(snake)
@@ -629,34 +707,35 @@ fn cache_v2_twirp(v2: &CacheV2, method: &str, req: &Request) -> Response {
             .cloned()
             .unwrap_or(Value::Null)
     };
-    let key = body["key"].as_str().unwrap_or_default().to_lowercase();
-    let version = body["version"].as_str().unwrap_or_default();
-    let host = req.headers.get("host").cloned().unwrap_or_default();
+    let text = |name: &str| body.get(name).and_then(Value::as_str).unwrap_or_default();
+    let key = text("key").to_lowercase();
+    let version = text("version");
     // A refused save is `ok: false` with a reason, which the toolkit logs as a
     // warning without failing the step.
-    let save_denied = || {
-        Response::json(
-            200,
-            json!({"ok": false, "message": format!("cache-mode {} does not allow saving", mode.name())}),
-        )
-    };
+    let refused = |message: String| Response::json(200, json!({"ok": false, "message": message}));
+    let save_denied = || refused(format!("cache-mode {} does not allow saving", mode.name()));
     match method {
         "CreateCacheEntry" => {
             if !mode.can_save() {
                 return save_denied();
             }
-            let Some(id) = v2.store.lock().unwrap().reserve(&key, version) else {
+            let Some(id) = v2
+                .store
+                .lock()
+                .unwrap()
+                .reserve(&key, version, Some(&owner))
+            else {
                 // Non-retryable: logged as "another job may be creating this cache".
                 return twirp_error(
                     409,
                     "already_exists",
-                    &format!("cache entry {key} already exists"),
+                    "a cache entry with this key and version exists or is being uploaded",
                 );
             };
             Response::json(
                 200,
-                json!({"ok": true, "signedUploadUrl": format!(
-                    "http://{host}/cache-v2/upload/{id}?{}", v2.signer.sign("cache-upload", id)
+                json!({"ok": true, "signed_upload_url": format!(
+                    "{origin}/cache-v2/upload/{id}?{}", v2.signer.sign("cache-upload", id)
                 )}),
             )
         }
@@ -665,29 +744,42 @@ fn cache_v2_twirp(v2: &CacheV2, method: &str, req: &Request) -> Response {
                 return save_denied();
             }
             // Left out when 0 (`emitDefaultValues: false`).
-            let size = json_u64(&field("sizeBytes", "size_bytes")).unwrap_or(0);
+            let size = match field("sizeBytes", "size_bytes") {
+                Value::Null => Some(0),
+                v => json_u64(&v),
+            };
+            let Some(size) = size else {
+                return refused("size_bytes is not a valid size".into());
+            };
             let mut store = v2.store.lock().unwrap();
+            // Only the reservation this job made: another job's upload of the
+            // same key is not what this job sent.
             let Some(id) = store
                 .entries
                 .iter()
-                .find(|e| !e.complete && e.key == key && e.version == version)
+                .find(|e| {
+                    !e.complete
+                        && e.key == key
+                        && e.version == version
+                        && store.owners.get(&e.id) == Some(&owner)
+                })
                 .map(|e| e.id)
             else {
-                return Response::json(
-                    200,
-                    json!({"ok": false, "message": format!("no pending upload for {key}")}),
-                );
+                return refused("no pending upload for this key and version".into());
             };
-            let uploaded = std::fs::metadata(store.blob(id)).map_or(0, |m| m.len());
+            let staging = store.staging(id);
+            let Ok(uploaded) = std::fs::metadata(&staging).map(|m| m.len()) else {
+                return refused("the uploaded data is missing".into());
+            };
             if uploaded != size {
                 // Stays pending; `gc` drops it after 5 minutes.
-                return Response::json(
-                    200,
-                    json!({"ok": false, "message": format!("uploaded {uploaded} bytes, expected {size}")}),
-                );
+                return refused(format!("uploaded {uploaded} bytes, expected {size}"));
+            }
+            if std::fs::rename(&staging, store.blob(id)).is_err() {
+                return refused("the uploaded data could not be stored".into());
             }
             store.commit(id);
-            Response::json(200, json!({"ok": true, "entryId": id.to_string()}))
+            Response::json(200, json!({"ok": true, "entry_id": id.to_string()}))
         }
         "GetCacheEntryDownloadURL" => {
             // A miss is `ok: false`, logged by the toolkit at debug level.
@@ -719,14 +811,36 @@ fn cache_v2_twirp(v2: &CacheV2, method: &str, req: &Request) -> Response {
             Response::json(
                 200,
                 json!({
-                    "ok": true, "matchedKey": matched,
-                    "signedDownloadUrl": format!(
-                        "http://{host}/cache-v2/download/{id}?{}", v2.signer.sign("cache-download", id)
+                    "ok": true, "matched_key": matched,
+                    "signed_download_url": format!(
+                        "{origin}/cache-v2/download/{id}?{}", v2.signer.sign("cache-download", id)
                     ),
                 }),
             )
         }
-        _ => twirp_error(404, "bad_route", method),
+        _ => unreachable!("checked against `known`"),
+    }
+}
+
+impl CacheV2 {
+    /// Put `staged`, received for entry `id` without the lock, in place while
+    /// `id` is still pending: a PUT that loses a race with a finalize or `gc`
+    /// leaves the committed blob alone and recreates nothing (the staged file
+    /// goes when it drops). Only renames happen under the lock. A placed upload
+    /// counts as use, so `gc` keeps a reservation whose data still arrives.
+    fn place(&self, id: u64, staged: Staged) -> Response {
+        let mut store = self.store.lock().unwrap();
+        let (blocks, staging) = (store.blocks(id), store.staging(id));
+        let Some(e) = store.entries.iter_mut().find(|e| e.id == id && !e.complete) else {
+            return Response::empty(404);
+        };
+        match staged.place(&blocks, &staging) {
+            Ok(_) => {
+                e.used = now();
+                Response::empty(201)
+            }
+            Err(_) => Response::empty(400),
+        }
     }
 }
 
@@ -761,14 +875,14 @@ fn cache_v2_blob(v2: &CacheV2, req: &Request) -> Response {
     {
         return Response::empty(404);
     }
-    let (blob, blocks) = (store.blob(id), store.blocks(id));
+    let (blob, blocks, staging) = (store.blob(id), store.blocks(id), store.staging(id));
     // Other jobs' cache calls go on while blob data is copied.
     drop(store);
     if !upload {
         return Response::file(&blob, "application/octet-stream", None);
     }
-    match write_block_blob(req, &blocks, &blob) {
-        Ok(_) => Response::empty(201),
+    match stage_block_blob(req, &blocks, &staging) {
+        Ok(staged) => v2.place(id, staged),
         Err(_) => Response::empty(400),
     }
 }
@@ -918,28 +1032,52 @@ impl UrlSigner {
     }
 }
 
-/// An Azure-blob-style upload of `req` to `file`: Put Blob (no `comp`), Put
-/// Block (`comp=block`, kept under `blocks`) or Put Block List
-/// (`comp=blocklist`, joining the listed blocks into `file` and removing
-/// `blocks`). Returns the size of `file` when it was written.
-fn write_block_blob(req: &Request, blocks: &Path, file: &Path) -> Result<Option<u64>> {
-    let create_parent = || -> Result<()> {
-        if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent)?;
+/// An Azure-blob-style upload received into a temporary file beside the file it
+/// is for, so that a failed, repeated or late request never truncates what is
+/// there; `Staged::place` renames it into place.
+enum Staged {
+    /// Put Block (`comp=block`): the block, for `blocks/<hex(blockid)>`.
+    Block(tempfile::NamedTempFile, String),
+    /// Put Blob (no `comp`), or Put Block List (`comp=blocklist`) with the
+    /// listed blocks joined in order: the whole blob, and its size.
+    Blob(tempfile::NamedTempFile, u64),
+}
+
+impl Staged {
+    /// Rename into place: a block under `blocks`, a blob over `file`. The
+    /// blob's size; `None` for a block.
+    fn place(self, blocks: &Path, file: &Path) -> Result<Option<u64>> {
+        match self {
+            Staged::Block(tmp, name) => {
+                std::fs::create_dir_all(blocks)?;
+                tmp.persist(blocks.join(name))?;
+                Ok(None)
+            }
+            Staged::Blob(tmp, size) => {
+                tmp.persist(file)?;
+                Ok(Some(size))
+            }
         }
-        Ok(())
-    };
+    }
+}
+
+/// Receive an Azure-blob-style upload of `req` for `file` (blocks under
+/// `blocks`) into a temporary file in `file`'s directory. A block list reads
+/// the blocks and leaves them, so the same list sent again (a retry whose
+/// first answer got lost) joins the same blob; whoever owns the upload removes
+/// `blocks` when it is finalized.
+fn stage_block_blob(req: &Request, blocks: &Path, file: &Path) -> Result<Staged> {
+    let dir = file.parent().context("upload path without a directory")?;
+    std::fs::create_dir_all(dir)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     Ok(match req.query.get("comp").map(String::as_str) {
         Some("block") => {
             let block = req.query.get("blockid").cloned().unwrap_or_default();
-            std::fs::create_dir_all(blocks)?;
-            std::fs::write(blocks.join(hex::encode(block)), &req.body)?;
-            None
+            tmp.write_all(&req.body)?;
+            Staged::Block(tmp, hex::encode(block))
         }
         Some("blocklist") => {
             let xml = String::from_utf8_lossy(&req.body);
-            create_parent()?;
-            let mut out = std::fs::File::create(file)?;
             let mut size = 0u64;
             for chunk in xml.split('>').skip(1) {
                 let Some((block, _)) = chunk.split_once('<') else {
@@ -950,17 +1088,22 @@ fn write_block_blob(req: &Request, blocks: &Path, file: &Path) -> Result<Option<
                     continue;
                 }
                 let mut data = std::fs::File::open(blocks.join(hex::encode(block)))?;
-                size += std::io::copy(&mut data, &mut out)?;
+                size += std::io::copy(&mut data, tmp.as_file_mut())?;
             }
-            let _ = std::fs::remove_dir_all(blocks);
-            Some(size)
+            Staged::Blob(tmp, size)
         }
         _ => {
-            create_parent()?;
-            std::fs::write(file, &req.body)?;
-            Some(req.body.len() as u64)
+            tmp.write_all(&req.body)?;
+            Staged::Blob(tmp, req.body.len() as u64)
         }
     })
+}
+
+/// An Azure-blob-style upload of `req` to `file`, staged and then put in
+/// place at once (see `stage_block_blob`). Returns the size of `file` when it
+/// was written.
+fn write_block_blob(req: &Request, blocks: &Path, file: &Path) -> Result<Option<u64>> {
+    stage_block_blob(req, blocks, file)?.place(blocks, file)
 }
 
 impl ArtifactStore {
@@ -1134,11 +1277,12 @@ fn artifact_handler(
     cache_v2: Option<&CacheV2>,
     req: Request,
 ) -> Response {
-    // The cache handler checks tokens and signatures itself.
-    if let Some(r) = cache_v2.and_then(|v2| cache_v2_route(v2, &req)) {
+    let host = host_header(&req);
+    // The cache handler checks tokens and signatures itself. Jobs reach this
+    // port at its `Host`, also with `--cache-server-external-url`.
+    if let Some(r) = cache_v2.and_then(|v2| cache_v2_route(v2, &req, &format!("http://{host}"))) {
         return r;
     }
-    let host = req.headers.get("host").cloned().unwrap_or_default();
     let mut store = shared.lock().unwrap();
     // Block uploads and downloads go to the signed URLs `twirp` hands out,
     // without a token; every other call carries the job's.
@@ -1232,7 +1376,10 @@ fn twirp(store: &mut ArtifactStore, method: &str, req: &Request, host: &str) -> 
                     if size > 0 {
                         a.size = size;
                     }
-                    Response::json(200, json!({"ok": true, "artifactId": a.id.to_string()}))
+                    let id = a.id;
+                    // A block list leaves its blocks for a retry of it.
+                    let _ = std::fs::remove_dir_all(store.blocks_dir(id));
+                    Response::json(200, json!({"ok": true, "artifactId": id.to_string()}))
                 }
                 None => twirp_error(404, "not_found", "artifact not found"),
             }
@@ -1437,6 +1584,7 @@ impl Servers {
                     store: Arc::new(Mutex::new(store)),
                     signer: UrlSigner::new(),
                     auth: servers.auth.clone(),
+                    external: cli.cache_server_external_url.as_deref().map(url_origin),
                 };
                 let token = servers.cache_token.clone();
                 let handler = v2.clone();
@@ -1516,10 +1664,14 @@ impl Servers {
             env.push(("ACTIONS_CACHE_URL".into(), url));
             // The caller's token is the same for every job and carries no
             // cache-mode, which v2 then takes as `write`: other jobs keep v1,
-            // which enforces their mode by URL.
-            if self.auth.from_env.is_none() || cache_mode == CacheMode::Write {
-                env.push(("ACTIONS_CACHE_SERVICE_V2".into(), "true".into()));
-            }
+            // which enforces their mode by URL. They get an empty value, not
+            // none, so a host job cannot inherit v2 from runthrough's own
+            // environment (the toolkit tests the variable for truthiness).
+            let v2 = self.auth.from_env.is_none() || cache_mode == CacheMode::Write;
+            env.push((
+                "ACTIONS_CACHE_SERVICE_V2".into(),
+                if v2 { "true" } else { "" }.into(),
+            ));
             // v2 is served at the root of this origin (the toolkit drops any
             // path); with the artifact server on, its port forwards v2 calls.
             if self.artifact_port.is_none() {
@@ -1996,15 +2148,17 @@ mod tests {
             store: Arc::new(Mutex::new(CacheStore::open(dir).unwrap())),
             signer: UrlSigner::new(),
             auth,
+            external: None,
         }
     }
 
-    /// A Twirp `CacheService` call to `host: h:1`; its status and JSON body.
-    fn v2_twirp(
+    /// A Twirp `CacheService` call with a raw body to `host: h:1`; its status
+    /// and JSON body.
+    fn v2_twirp_raw(
         handler: &dyn Fn(Request) -> Response,
         token: Option<&str>,
         method: &str,
-        body: Value,
+        body: &[u8],
     ) -> (u16, Value) {
         let mut headers = HashMap::from([("host".to_string(), "h:1".to_string())]);
         if let Some(t) = token {
@@ -2015,13 +2169,23 @@ mod tests {
             path: format!("{CACHE_SERVICE}{method}"),
             query: HashMap::new(),
             headers,
-            body: body.to_string().into_bytes(),
+            body: body.to_vec(),
         });
         (r.status, serde_json::from_slice(&r.body).unwrap())
     }
 
-    /// A request to `url` (on `http://h:1`) with `extra` appended to its query,
-    /// as the Azure SDK does.
+    /// A Twirp `CacheService` call to `host: h:1`; its status and JSON body.
+    fn v2_twirp(
+        handler: &dyn Fn(Request) -> Response,
+        token: Option<&str>,
+        method: &str,
+        body: Value,
+    ) -> (u16, Value) {
+        v2_twirp_raw(handler, token, method, body.to_string().as_bytes())
+    }
+
+    /// A request to `url` (any origin) with `extra` appended to its query, as
+    /// the Azure SDK does.
     fn url_req(
         method: &str,
         url: &str,
@@ -2029,7 +2193,8 @@ mod tests {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Request {
-        let rest = url.strip_prefix("http://h:1").unwrap();
+        let rest = url.split_once("://").unwrap().1;
+        let rest = &rest[rest.find('/').unwrap()..];
         let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
         Request {
             method: method.into(),
@@ -2059,16 +2224,42 @@ mod tests {
         )
     }
 
-    /// Create → Put Blob → Finalize; the signed upload URL.
-    fn v2_save(h: &dyn Fn(Request) -> Response, token: &str, key: &str, data: &[u8]) -> String {
-        let (_, created) = v2_twirp(
+    /// The field names of a JSON object, sorted.
+    fn fields(v: &Value) -> Vec<&str> {
+        let mut names: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        names.sort();
+        names
+    }
+
+    /// CreateCacheEntry that succeeds; the signed upload URL.
+    fn v2_create(h: &dyn Fn(Request) -> Response, token: &str, key: &str) -> String {
+        let (status, created) = v2_twirp(
             h,
             Some(token),
             "CreateCacheEntry",
             json!({"key": key, "version": "v"}),
         );
-        assert_eq!(created["ok"], true, "{created}");
-        let url = created["signedUploadUrl"].as_str().unwrap().to_string();
+        assert_eq!(status, 200);
+        assert_eq!(fields(&created), ["ok", "signed_upload_url"], "{created}");
+        assert_eq!(created["ok"], true);
+        created["signed_upload_url"].as_str().unwrap().to_string()
+    }
+
+    /// FinalizeCacheEntryUpload of `size` bytes; its status-200 body.
+    fn v2_finalize(h: &dyn Fn(Request) -> Response, token: &str, key: &str, size: Value) -> Value {
+        let (status, done) = v2_twirp(
+            h,
+            Some(token),
+            "FinalizeCacheEntryUpload",
+            json!({"key": key, "version": "v", "size_bytes": size}),
+        );
+        assert_eq!(status, 200);
+        done
+    }
+
+    /// Create → Put Blob → Finalize; the signed upload URL.
+    fn v2_save(h: &dyn Fn(Request) -> Response, token: &str, key: &str, data: &[u8]) -> String {
+        let url = v2_create(h, token, key);
         let put = h(url_req(
             "PUT",
             &url,
@@ -2077,17 +2268,14 @@ mod tests {
             data,
         ));
         assert_eq!(put.status, 201);
-        let (_, done) = v2_twirp(
-            h,
-            Some(token),
-            "FinalizeCacheEntryUpload",
-            json!({"key": key, "version": "v", "size_bytes": data.len().to_string()}),
-        );
-        assert_eq!(done["ok"], true, "{done}");
+        let done = v2_finalize(h, token, key, json!(data.len().to_string()));
+        assert_eq!(fields(&done), ["entry_id", "ok"], "{done}");
+        assert_eq!(done["ok"], true);
         url
     }
 
-    /// GetCacheEntryDownloadURL then GET: the matched key and the bytes.
+    /// GetCacheEntryDownloadURL then GET: the matched key and the bytes, or
+    /// `None` for a miss, which must be exactly `{"ok": false}` with status 200.
     fn v2_restore(
         h: &dyn Fn(Request) -> Response,
         token: &str,
@@ -2101,12 +2289,18 @@ mod tests {
             json!({"key": key, "restore_keys": restore_keys, "version": "v"}),
         );
         assert_eq!(status, 200);
-        if found["ok"] != true {
+        if found == json!({"ok": false}) {
             return None;
         }
+        assert_eq!(
+            fields(&found),
+            ["matched_key", "ok", "signed_download_url"],
+            "{found}"
+        );
+        assert_eq!(found["ok"], true);
         let resp = h(url_req(
             "GET",
-            found["signedDownloadUrl"].as_str().unwrap(),
+            found["signed_download_url"].as_str().unwrap(),
             "",
             &[],
             b"",
@@ -2114,7 +2308,33 @@ mod tests {
         assert_eq!(resp.status, 200);
         let (head, body) = on_wire(&resp);
         assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())));
-        Some((found["matchedKey"].as_str().unwrap().to_string(), body))
+        Some((found["matched_key"].as_str().unwrap().to_string(), body))
+    }
+
+    /// Entry `id` last reserved or used `minutes` ago.
+    fn age(v2: &CacheV2, id: u64, minutes: u64) {
+        for e in v2
+            .store
+            .lock()
+            .unwrap()
+            .entries
+            .iter_mut()
+            .filter(|e| e.id == id)
+        {
+            e.created = now() - minutes * MINUTE_MS;
+            e.used = e.created;
+        }
+    }
+
+    /// The names in the store's `blobs/`, sorted: no staged upload is left over.
+    fn blob_files(v2: &CacheV2) -> Vec<String> {
+        let dir = v2.store.lock().unwrap().dir.join("blobs");
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     #[test]
@@ -2124,34 +2344,23 @@ mod tests {
         let token = auth.issue(&json!({}));
         let v2 = v2_service(dir.path(), auth);
         let h = |req| cache_server(&v2, "tok", req);
-        let (status, created) = v2_twirp(
-            &h,
-            Some(&token),
-            "CreateCacheEntry",
-            json!({"key": "Deps-Linux", "version": "v"}),
-        );
-        assert_eq!(status, 200);
-        assert_eq!(created["ok"], true);
-        let url = created["signedUploadUrl"].as_str().unwrap();
+        let url = v2_create(&h, &token, "Deps-Linux");
         assert!(
             url.starts_with("http://h:1/cache-v2/upload/1?expires="),
             "{url}"
         );
         let put = h(url_req(
             "PUT",
-            url,
+            &url,
             "",
             &[("x-ms-blob-type", "BlockBlob")],
             b"cached bytes",
         ));
         assert_eq!(put.status, 201);
-        let (_, done) = v2_twirp(
-            &h,
-            Some(&token),
-            "FinalizeCacheEntryUpload",
-            json!({"key": "Deps-Linux", "version": "v", "size_bytes": "12"}),
+        assert_eq!(
+            v2_finalize(&h, &token, "Deps-Linux", json!("12")),
+            json!({"ok": true, "entry_id": "1"})
         );
-        assert_eq!(done, json!({"ok": true, "entryId": "1"}));
         assert_eq!(
             v2_restore(&h, &token, "Deps-Linux", &[]),
             Some(("deps-linux".to_string(), b"cached bytes".to_vec()))
@@ -2163,10 +2372,53 @@ mod tests {
             "CreateCacheEntry",
             json!({"key": "deps-linux", "version": "v"}),
         );
-        assert_eq!(status, 409);
-        assert_eq!(again["code"], "already_exists");
+        assert_eq!(
+            (status, again),
+            (
+                409,
+                json!({"code": "already_exists", "msg": "a cache entry with this key and version exists or is being uploaded"})
+            )
+        );
         let (status, unknown) = v2_twirp(&h, Some(&token), "DeleteCacheEntry", json!({}));
         assert_eq!((status, unknown["code"].as_str()), (404, Some("bad_route")));
+    }
+
+    /// The toolkit masks the signatures of `signed_upload_url` and
+    /// `signed_download_url` (proto names) before it logs a response body, so
+    /// every answer uses proto names and none the lowerCamelCase ones.
+    #[test]
+    fn cache_v2_answers_with_proto_field_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        // `v2_create`, `v2_save` and `v2_restore` check the exact field names.
+        v2_save(&h, &token, "k", b"data");
+        assert!(v2_restore(&h, &token, "k", &[]).is_some());
+        let (_, created) = v2_twirp(
+            &h,
+            Some(&token),
+            "CreateCacheEntry",
+            json!({"key": "other", "version": "v"}),
+        );
+        let (_, done) = v2_twirp(
+            &h,
+            Some(&token),
+            "FinalizeCacheEntryUpload",
+            json!({"key": "other", "version": "v", "size_bytes": "9"}),
+        );
+        assert_eq!(fields(&done), ["message", "ok"]);
+        for body in [created, done] {
+            for camel in [
+                "signedUploadUrl",
+                "signedDownloadUrl",
+                "entryId",
+                "matchedKey",
+            ] {
+                assert!(body.get(camel).is_none(), "{body}");
+            }
+        }
     }
 
     #[test]
@@ -2176,36 +2428,94 @@ mod tests {
         let token = auth.issue(&json!({}));
         let v2 = v2_service(dir.path(), auth);
         let h = |req| cache_server(&v2, "tok", req);
-        let (_, created) = v2_twirp(
-            &h,
-            Some(&token),
-            "CreateCacheEntry",
-            json!({"key": "big", "version": "v"}),
-        );
-        let url = created["signedUploadUrl"].as_str().unwrap();
+        let url = v2_create(&h, &token, "big");
         for (block, data) in [("AAAB", b"world".as_slice()), ("AAAA", b"hello ")] {
             let extra = format!("comp=block&blockid={block}");
-            assert_eq!(h(url_req("PUT", url, &extra, &[], data)).status, 201);
+            assert_eq!(h(url_req("PUT", &url, &extra, &[], data)).status, 201);
         }
         let blocks = dir.path().join("blocks").join("1");
         assert!(blocks.is_dir());
         let list = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><BlockList><Latest>AAAA</Latest><Latest>AAAB</Latest></BlockList>"#;
         assert_eq!(
-            h(url_req("PUT", url, "comp=blocklist", &[], list)).status,
+            h(url_req("PUT", &url, "comp=blocklist", &[], list)).status,
             201
         );
-        assert!(!blocks.exists());
-        let (_, done) = v2_twirp(
-            &h,
-            Some(&token),
-            "FinalizeCacheEntryUpload",
-            json!({"key": "big", "version": "v", "sizeBytes": 11}),
-        );
+        let done = v2_finalize(&h, &token, "big", json!(11));
         assert_eq!(done["ok"], true);
+        // The blocks stay for a repeated block list until the entry is final.
+        assert!(!blocks.exists());
         assert_eq!(
             v2_restore(&h, &token, "big", &[]).unwrap().1,
             b"hello world"
         );
+        assert_eq!(blob_files(&v2), ["1"]);
+    }
+
+    /// A Put Block List sent again after it succeeded (its 201 lost on the way)
+    /// answers 201 with the same blob; one naming a missing block fails and
+    /// leaves what was there. Shared with the artifact server.
+    #[test]
+    fn block_lists_are_atomic_and_can_be_repeated() {
+        let dir = tempfile::tempdir().unwrap();
+        let (blocks, file) = (dir.path().join("blocks"), dir.path().join("out").join("f"));
+        let put = |query: &str, body: &[u8]| {
+            write_block_blob(
+                &url_req("PUT", &format!("http://h:1/x?{query}"), "", &[], body),
+                &blocks,
+                &file,
+            )
+        };
+        put("comp=block&blockid=b1", b"hello ").unwrap();
+        put("comp=block&blockid=b2", b"world").unwrap();
+        let list = b"<BlockList><Latest>b1</Latest><Latest>b2</Latest></BlockList>";
+        for _ in 0..2 {
+            assert_eq!(put("comp=blocklist", list).unwrap(), Some(11));
+            assert_eq!(std::fs::read(&file).unwrap(), b"hello world");
+        }
+        let broken = b"<BlockList><Latest>b2</Latest><Latest>b3</Latest></BlockList>";
+        assert!(put("comp=blocklist", broken).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"hello world");
+        // Nothing staged is left beside the file.
+        assert_eq!(
+            std::fs::read_dir(file.parent().unwrap()).unwrap().count(),
+            1
+        );
+
+        // Through the cache API: a repeated list is a 201, a broken one a 400,
+        // and neither changes the upload.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(cache_dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let url = v2_create(&h, &token, "k");
+        assert_eq!(
+            h(url_req(
+                "PUT",
+                &url,
+                "comp=block&blockid=AAAA",
+                &[],
+                b"data"
+            ))
+            .status,
+            201
+        );
+        let list = b"<BlockList><Latest>AAAA</Latest></BlockList>";
+        for _ in 0..2 {
+            assert_eq!(
+                h(url_req("PUT", &url, "comp=blocklist", &[], list)).status,
+                201
+            );
+        }
+        let broken = b"<BlockList><Latest>AAAA</Latest><Latest>AAAB</Latest></BlockList>";
+        assert_eq!(
+            h(url_req("PUT", &url, "comp=blocklist", &[], broken)).status,
+            400
+        );
+        let staging = v2.store.lock().unwrap().staging(1);
+        assert_eq!(std::fs::read(staging).unwrap(), b"data");
+        assert_eq!(v2_finalize(&h, &token, "k", json!("4"))["ok"], true);
+        assert_eq!(v2_restore(&h, &token, "k", &[]).unwrap().1, b"data");
     }
 
     #[test]
@@ -2215,37 +2525,381 @@ mod tests {
         let token = auth.issue(&json!({}));
         let v2 = v2_service(dir.path(), auth);
         let h = |req| cache_server(&v2, "tok", req);
-        let (_, created) = v2_twirp(
-            &h,
-            Some(&token),
-            "CreateCacheEntry",
-            json!({"key": "k", "version": "v"}),
-        );
-        let url = created["signedUploadUrl"].as_str().unwrap();
-        assert_eq!(h(url_req("PUT", url, "", &[], b"short")).status, 201);
-        let (status, done) = v2_twirp(
-            &h,
-            Some(&token),
-            "FinalizeCacheEntryUpload",
-            json!({"key": "k", "version": "v", "size_bytes": "6"}),
-        );
-        assert_eq!(status, 200);
+        let url = v2_create(&h, &token, "k");
+        assert_eq!(h(url_req("PUT", &url, "", &[], b"short")).status, 201);
         assert_eq!(
-            done,
+            v2_finalize(&h, &token, "k", json!("6")),
             json!({"ok": false, "message": "uploaded 5 bytes, expected 6"})
         );
         assert_eq!(v2_restore(&h, &token, "k", &[]), None);
         assert!(!v2.store.lock().unwrap().entries[0].complete);
-        let (_, none) = v2_twirp(
+        assert_eq!(
+            v2_finalize(&h, &token, "other", json!("5")),
+            json!({"ok": false, "message": "no pending upload for this key and version"})
+        );
+    }
+
+    /// `size_bytes` that is not an unsigned integer, or an upload whose data is
+    /// gone, is refused with a reason instead of committing an entry no
+    /// download can serve; a missing `size_bytes` still means 0.
+    #[test]
+    fn cache_v2_finalize_refuses_bad_sizes_and_missing_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        v2_create(&h, &token, "k");
+        let invalid = json!({"ok": false, "message": "size_bytes is not a valid size"});
+        for size in [
+            json!("-1"),
+            json!(-1),
+            json!("twelve"),
+            json!(1.5),
+            json!(true),
+        ] {
+            assert_eq!(
+                v2_finalize(&h, &token, "k", size.clone()),
+                invalid,
+                "{size}"
+            );
+        }
+        assert!(!v2.store.lock().unwrap().entries[0].complete);
+        let staging = v2.store.lock().unwrap().staging(1);
+        std::fs::remove_file(&staging).unwrap();
+        assert_eq!(
+            v2_finalize(&h, &token, "k", json!("0")),
+            json!({"ok": false, "message": "the uploaded data is missing"})
+        );
+        assert!(!v2.store.lock().unwrap().entries[0].complete);
+        assert_eq!(v2_restore(&h, &token, "k", &[]), None);
+        // An empty upload with `size_bytes` left out (0) is a valid entry.
+        v2_create(&h, &token, "empty");
+        let (_, done) = v2_twirp(
             &h,
             Some(&token),
             "FinalizeCacheEntryUpload",
-            json!({"key": "other", "version": "v", "size_bytes": "5"}),
+            json!({"key": "empty", "version": "v"}),
         );
+        assert_eq!(done["ok"], true, "{done}");
+        assert_eq!(v2_restore(&h, &token, "empty", &[]).unwrap().1, b"");
+    }
+
+    /// A PUT that passed its pending check before a finalize or `gc` and lands
+    /// after it neither changes the committed blob nor recreates a dropped
+    /// upload: its data is staged, and only put in place while still pending.
+    #[test]
+    fn cache_v2_late_uploads_change_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({"scp": "a"}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let paths = |id| {
+            let s = v2.store.lock().unwrap();
+            (s.blob(id), s.blocks(id), s.staging(id))
+        };
+        // A retried Put Blob is received while the first one commits.
+        let url = v2_create(&h, &token, "k");
+        assert_eq!(h(url_req("PUT", &url, "", &[], b"good")).status, 201);
+        let (blob, blocks, staging) = paths(1);
+        let late =
+            stage_block_blob(&url_req("PUT", &url, "", &[], b"evil!"), &blocks, &staging).unwrap();
+        assert_eq!(v2_finalize(&h, &token, "k", json!("4"))["ok"], true);
+        assert_eq!(v2.place(1, late).status, 404);
+        assert_eq!(std::fs::read(&blob).unwrap(), b"good");
+        assert!(!staging.exists());
+        // A PUT sent after the commit is refused before it is read.
+        assert_eq!(h(url_req("PUT", &url, "", &[], b"evil!")).status, 404);
+        assert_eq!(v2_restore(&h, &token, "k", &[]).unwrap().1, b"good");
+        assert_eq!(blob_files(&v2), ["1"]);
+
+        // A Put Blob and a Put Block are received while `gc` drops the upload.
+        let url = v2_create(&h, &token, "gone");
+        let (blob, blocks, staging) = paths(2);
+        let late_blob =
+            stage_block_blob(&url_req("PUT", &url, "", &[], b"late"), &blocks, &staging).unwrap();
+        let block = url_req("PUT", &url, "comp=block&blockid=AAAA", &[], b"late");
+        let late_block = stage_block_blob(&block, &blocks, &staging).unwrap();
+        age(&v2, 2, 10);
+        v2.store.lock().unwrap().gc(now());
+        assert!(v2.store.lock().unwrap().entries.iter().all(|e| e.id != 2));
+        assert_eq!(v2.place(2, late_blob).status, 404);
+        assert_eq!(v2.place(2, late_block).status, 404);
+        assert!(!blob.exists() && !staging.exists() && !blocks.exists());
+        assert_eq!(blob_files(&v2), ["1"]);
+    }
+
+    /// While a reservation of a key and version is in use, another job gets
+    /// the conflict a complete entry gives ("another job may be creating this
+    /// cache"), and a finalize only commits the caller's own reservation. v1
+    /// keeps replacing a pending reservation.
+    #[test]
+    fn cache_v2_one_upload_per_key_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let (a, b) = (
+            auth.issue(&json!({"scp": "a"})),
+            auth.issue(&json!({"scp": "b"})),
+        );
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let conflict = (
+            409,
+            json!({"code": "already_exists", "msg": "a cache entry with this key and version exists or is being uploaded"}),
+        );
+        let create = |token: &str, key: &str| {
+            v2_twirp(
+                &h,
+                Some(token),
+                "CreateCacheEntry",
+                json!({"key": key, "version": "v"}),
+            )
+        };
+        let no_pending =
+            json!({"ok": false, "message": "no pending upload for this key and version"});
+
+        let url_a = v2_create(&h, &a, "k");
+        assert_eq!(create(&b, "k"), conflict);
+        assert_eq!(h(url_req("PUT", &url_a, "", &[], b"AAAA")).status, 201);
+        // B's finalize does not commit A's upload.
+        assert_eq!(v2_finalize(&h, &b, "k", json!("4")), no_pending);
         assert_eq!(
-            none,
-            json!({"ok": false, "message": "no pending upload for other"})
+            v2_finalize(&h, &a, "k", json!("4")),
+            json!({"ok": true, "entry_id": "1"})
         );
+        assert_eq!(create(&b, "k"), conflict);
+        assert_eq!(v2_restore(&h, &b, "k", &[]).unwrap().1, b"AAAA");
+
+        // An abandoned reservation (5 minutes without use) is replaced; its
+        // job's late upload and finalize then fail instead of committing B's.
+        let url_a = v2_create(&h, &a, "j");
+        assert_eq!(h(url_req("PUT", &url_a, "", &[], b"AAAA")).status, 201);
+        age(&v2, 2, 6);
+        let url_b = v2_create(&h, &b, "j");
+        assert!(url_b.contains("/upload/3?"), "{url_b}");
+        assert_eq!(h(url_req("PUT", &url_a, "", &[], b"AAAA")).status, 404);
+        assert_eq!(h(url_req("PUT", &url_b, "", &[], b"BBBB")).status, 201);
+        assert_eq!(v2_finalize(&h, &a, "j", json!("4")), no_pending);
+        assert_eq!(
+            v2_finalize(&h, &b, "j", json!("4")),
+            json!({"ok": true, "entry_id": "3"})
+        );
+        assert_eq!(v2_restore(&h, &a, "j", &[]).unwrap().1, b"BBBB");
+
+        // v1 is unchanged: a second reservation replaces a pending one.
+        let v1_reserve = || {
+            h(Request {
+                method: "POST".into(),
+                path: "/tok/_apis/artifactcache/caches".into(),
+                query: HashMap::new(),
+                headers: HashMap::new(),
+                body: json!({"key": "v1", "version": "v"})
+                    .to_string()
+                    .into_bytes(),
+            })
+            .status
+        };
+        assert_eq!((v1_reserve(), v1_reserve()), (201, 201));
+        let pending: Vec<u64> = v2
+            .store
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|e| e.key == "v1")
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(pending, [5]);
+    }
+
+    /// Uploads count as use: `gc` keeps a reservation whose blocks still
+    /// arrive after 5 minutes, and drops one that got nothing for as long.
+    #[test]
+    fn cache_v2_uploads_keep_their_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let url = v2_create(&h, &token, "busy");
+        v2_create(&h, &token, "idle");
+        age(&v2, 1, 6);
+        age(&v2, 2, 6);
+        assert_eq!(
+            h(url_req(
+                "PUT",
+                &url,
+                "comp=block&blockid=AAAA",
+                &[],
+                b"data"
+            ))
+            .status,
+            201
+        );
+        v2.store.lock().unwrap().gc(now());
+        let ids: Vec<u64> = v2
+            .store
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, [1]);
+        age(&v2, 1, 6);
+        let list = b"<BlockList><Latest>AAAA</Latest></BlockList>";
+        assert_eq!(
+            h(url_req("PUT", &url, "comp=blocklist", &[], list)).status,
+            201
+        );
+        v2.store.lock().unwrap().gc(now());
+        assert_eq!(v2_finalize(&h, &token, "busy", json!("4"))["ok"], true);
+        assert_eq!(v2_restore(&h, &token, "busy", &[]).unwrap().1, b"data");
+    }
+
+    /// A reservation that is replaced or dropped takes its blob, staging file
+    /// and blocks with it; a new one is in `index.json` at once, so a restart
+    /// still collects it.
+    #[test]
+    fn cache_v2_dropped_reservations_take_their_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let files = |id| {
+            let s = v2.store.lock().unwrap();
+            [s.blob(id), s.staging(id), s.blocks(id)].map(|p| p.exists())
+        };
+        // Replaced by a new reservation of the same key and version.
+        let url = v2_create(&h, &token, "k");
+        assert_eq!(h(url_req("PUT", &url, "", &[], b"whole")).status, 201);
+        assert_eq!(
+            h(url_req("PUT", &url, "comp=block&blockid=AAAA", &[], b"x")).status,
+            201
+        );
+        assert_eq!(files(1), [true, true, true]);
+        age(&v2, 1, 20);
+        let url = v2_create(&h, &token, "k");
+        assert_eq!(files(1), [false, false, false]);
+        // Recorded at once, and collected by the next start once abandoned.
+        let reopened = CacheStore::open(dir.path()).unwrap();
+        let pending: Vec<(u64, bool)> = reopened
+            .entries
+            .iter()
+            .map(|e| (e.id, e.complete))
+            .collect();
+        assert_eq!(pending, [(2, false)]);
+        assert!(url.contains("/upload/2?"), "{url}");
+        assert_eq!(
+            h(url_req("PUT", &url, "comp=block&blockid=AAAA", &[], b"x")).status,
+            201
+        );
+        age(&v2, 2, 20);
+        v2.store.lock().unwrap().save();
+        let reopened = CacheStore::open(dir.path()).unwrap();
+        assert!(reopened.entries.is_empty());
+        assert_eq!(files(2), [false, false, false]);
+        assert!(blob_files(&v2).is_empty());
+    }
+
+    /// With `--cache-server-external-url`, jobs reach the cache port at that
+    /// origin (scheme included), so the signed blob URLs name it; the artifact
+    /// port, which jobs reach at its `Host`, keeps that.
+    #[test]
+    fn cache_v2_signs_urls_for_the_external_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = CacheV2 {
+            external: Some(url_origin("https://proxy.example/prefix/")),
+            ..v2_service(dir.path(), auth.clone())
+        };
+        let h = |req| cache_server(&v2, "tok", req);
+        let url = v2_save(&h, &token, "k", b"data");
+        assert!(
+            url.starts_with("https://proxy.example/cache-v2/upload/1?"),
+            "{url}"
+        );
+        let (_, found) = v2_twirp(
+            &h,
+            Some(&token),
+            "GetCacheEntryDownloadURL",
+            json!({"key": "k", "version": "v"}),
+        );
+        let download = found["signed_download_url"].as_str().unwrap();
+        assert!(
+            download.starts_with("https://proxy.example/cache-v2/download/1?"),
+            "{download}"
+        );
+        assert_eq!(v2_restore(&h, &token, "k", &[]).unwrap().1, b"data");
+
+        let artifact_dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(ArtifactStore {
+            dir: artifact_dir.path().to_path_buf(),
+            artifacts: vec![],
+            signer: UrlSigner::new(),
+            auth,
+        }));
+        let with = |req| artifact_handler(store.clone(), Some(&v2), req);
+        let url = v2_create(&with, &token, "other");
+        assert!(url.starts_with("http://h:1/cache-v2/upload/2?"), "{url}");
+    }
+
+    /// A body that is not a JSON object gets a JSON Twirp error (not retried)
+    /// and changes nothing.
+    #[test]
+    fn cache_v2_malformed_bodies_change_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let malformed = (
+            400,
+            json!({"code": "malformed", "msg": "the request body is not a JSON object"}),
+        );
+        for method in [
+            "CreateCacheEntry",
+            "FinalizeCacheEntryUpload",
+            "GetCacheEntryDownloadURL",
+        ] {
+            for body in [br#"{"key":"#.as_slice(), b"", b"[]", br#""k""#, b"null"] {
+                assert_eq!(
+                    v2_twirp_raw(&h, Some(&token), method, body),
+                    malformed,
+                    "{method}"
+                );
+            }
+        }
+        assert!(v2.store.lock().unwrap().entries.is_empty());
+        assert!(blob_files(&v2).is_empty() && !dir.path().join("index.json").exists());
+    }
+
+    /// No message repeats the key: the toolkit turns any `msg` containing
+    /// `insufficient usage` into a quota error.
+    #[test]
+    fn cache_v2_messages_do_not_repeat_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = RuntimeAuth::new(None);
+        let token = auth.issue(&json!({}));
+        let v2 = v2_service(dir.path(), auth);
+        let h = |req| cache_server(&v2, "tok", req);
+        let key = "insufficient usage";
+        v2_save(&h, &token, key, b"x");
+        let (status, again) = v2_twirp(
+            &h,
+            Some(&token),
+            "CreateCacheEntry",
+            json!({"key": key, "version": "v"}),
+        );
+        assert_eq!(status, 409);
+        let missing = v2_finalize(&h, &token, "insufficient usage 2", json!("1"));
+        assert_eq!(missing["ok"], false);
+        for body in [again, missing] {
+            assert!(!body.to_string().contains(key), "{body}");
+        }
     }
 
     #[test]
@@ -2320,32 +2974,28 @@ mod tests {
         let e = reopened.lookup(&["from-v2".to_string()], "v").unwrap();
         assert_eq!(std::fs::read(reopened.blob(e.id)).unwrap(), b"world");
         // A block upload abandoned for over 5 minutes goes, blocks and all.
-        let (_, created) = v2_twirp(
-            &h,
-            Some(&token),
-            "CreateCacheEntry",
-            json!({"key": "abandoned", "version": "v"}),
-        );
-        let url = created["signedUploadUrl"].as_str().unwrap();
+        let url = v2_create(&h, &token, "abandoned");
         assert_eq!(
-            h(url_req("PUT", url, "comp=block&blockid=AAAA", &[], b"x")).status,
+            h(url_req("PUT", &url, "comp=block&blockid=AAAA", &[], b"x")).status,
             201
         );
-        let mut store = v2.store.lock().unwrap();
-        let id = store
+        let id = v2
+            .store
+            .lock()
+            .unwrap()
             .entries
             .iter()
             .find(|e| e.key == "abandoned")
             .unwrap()
             .id;
-        assert!(store.blocks(id).is_dir());
-        for e in store.entries.iter_mut().filter(|e| e.id == id) {
-            e.created = now() - 10 * MINUTE_MS;
-            e.used = e.created;
-        }
+        assert!(v2.store.lock().unwrap().blocks(id).is_dir());
+        age(&v2, id, 10);
+        let mut store = v2.store.lock().unwrap();
         store.gc(now());
         assert!(store.entries.iter().all(|e| e.id != id));
-        assert!(!store.blocks(id).exists() && !store.blob(id).exists());
+        assert!(
+            !store.blocks(id).exists() && !store.blob(id).exists() && !store.staging(id).exists()
+        );
     }
 
     #[test]
@@ -2379,6 +3029,7 @@ mod tests {
         ] {
             let t = token(mode);
             let name = mode.name();
+            // A denied restore is exactly `{"ok": false}` with status 200 (checked by `v2_restore`).
             assert_eq!(v2_restore(&h, &t, "seed", &[]).is_some(), restore, "{name}");
             let key = format!("new-{name}");
             let (status, created) = v2_twirp(
@@ -2389,15 +3040,16 @@ mod tests {
             );
             assert_eq!(status, 200);
             // Size 0 is left out, as the toolkit's encoder does.
-            let (_, done) = v2_twirp(
+            let (status, done) = v2_twirp(
                 &h,
                 Some(&t),
                 "FinalizeCacheEntryUpload",
                 json!({"key": key, "version": "v"}),
             );
+            assert_eq!(status, 200);
             if save {
+                assert_eq!(fields(&created), ["ok", "signed_upload_url"], "{name}");
                 assert_eq!(created["ok"], true, "{name}");
-                assert!(created["signedUploadUrl"].is_string());
                 assert_eq!(done["ok"], true, "{name}");
             } else {
                 let refused = json!({"ok": false, "message": format!("cache-mode {name} does not allow saving")});
@@ -2449,28 +3101,28 @@ mod tests {
         assert!(v2_restore(&hc, "ghs_real", "k", &[]).is_some());
 
         // Signed URLs: only this server's signature, for that kind and entry, in time.
-        let (_, created) = v2_twirp(
-            &h,
-            Some(&token),
-            "CreateCacheEntry",
-            json!({"key": "k", "version": "v"}),
-        );
-        let url = created["signedUploadUrl"].as_str().unwrap();
+        let url = v2_create(&h, &token, "k");
         let (base, query) = url.split_once('?').unwrap();
-        let sig = query.split_once("&sig=").unwrap().1;
-        let flipped = format!(
-            "{}{}",
-            &sig[..sig.len() - 1],
-            if sig.ends_with('0') { '1' } else { '0' }
-        );
+        let tampered = |query: &str| {
+            let sig = query.split_once("&sig=").unwrap().1;
+            let flipped = format!(
+                "{}{}",
+                &sig[..sig.len() - 1],
+                if sig.ends_with('0') { '1' } else { '0' }
+            );
+            query.replace(sig, &flipped)
+        };
         let past = now() - 1;
-        let expired = hex::encode(hmac_sha256(
-            &v2.signer.key,
-            format!("cache-upload/1/{past}").as_bytes(),
-        ));
+        let expired = |kind: &str| {
+            let sig = hex::encode(hmac_sha256(
+                &v2.signer.key,
+                format!("{kind}/1/{past}").as_bytes(),
+            ));
+            format!("expires={past}&sig={sig}")
+        };
         for query in [
-            query.replace(sig, &flipped),
-            format!("expires={past}&sig={expired}"),
+            tampered(query),
+            expired("cache-upload"),
             v2.signer.sign("upload", 1),
             v2.signer.sign("cache-download", 1),
             UrlSigner::new().sign("cache-upload", 1),
@@ -2479,28 +3131,35 @@ mod tests {
             let put = h(url_req("PUT", &format!("{base}?{query}"), "", &[], b"evil"));
             assert_eq!(put.status, 401, "{query}");
         }
-        // An artifact server's URL, with its own key and kind.
-        let artifact_url = UrlSigner::new().sign("download", 1);
-        let get = h(url_req(
-            "GET",
-            &format!("http://h:1/cache-v2/download/1?{artifact_url}"),
-            "",
-            &[],
-            b"",
-        ));
-        assert_eq!(get.status, 401);
-        let get = h(url_req(
-            "GET",
-            &url.replace("/upload/", "/download/"),
-            "",
-            &[],
-            b"",
-        ));
-        assert_eq!(get.status, 401);
         // The URL itself still works, and only for its own entry.
-        assert_eq!(h(url_req("PUT", url, "", &[], b"good")).status, 201);
+        assert_eq!(h(url_req("PUT", &url, "", &[], b"good")).status, 201);
         let other = url.replace("/upload/1?", "/upload/2?");
         assert_eq!(h(url_req("PUT", &other, "", &[], b"evil")).status, 401);
+        assert_eq!(v2_finalize(&h, &token, "k", json!("4"))["ok"], true);
+
+        // Downloads of the complete entry: the same checks.
+        let (_, found) = v2_twirp(
+            &h,
+            Some(&token),
+            "GetCacheEntryDownloadURL",
+            json!({"key": "k", "version": "v"}),
+        );
+        let download = found["signed_download_url"].as_str().unwrap();
+        let (base, query) = download.split_once('?').unwrap();
+        for query in [
+            tampered(query),
+            expired("cache-download"),
+            v2.signer.sign("cache-upload", 1),
+            // An artifact server's URL, with its own key and kind.
+            UrlSigner::new().sign("download", 1),
+            UrlSigner::new().sign("cache-download", 1),
+            String::new(),
+        ] {
+            let get = h(url_req("GET", &format!("{base}?{query}"), "", &[], b""));
+            assert_eq!(get.status, 401, "{query}");
+        }
+        let get = h(url_req("GET", download, "", &[], b""));
+        assert_eq!((get.status, on_wire(&get).1), (200, b"good".to_vec()));
     }
 
     #[test]
@@ -2524,6 +3183,11 @@ mod tests {
         };
         let get = |e: &HashMap<String, String>, k: &str| e.get(k).cloned();
         let s = |v: &str| Some(v.to_string());
+        // As today, the caller's ACTIONS_RUNTIME_URL wins over the artifact port.
+        let runtime_url = std::env::var("ACTIONS_RUNTIME_URL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "http://h:20/".to_string());
 
         let e = env(&servers(true, false, None, false), CacheMode::Write);
         assert_eq!(get(&e, "ACTIONS_CACHE_URL"), s("http://h:10/tok/"));
@@ -2536,13 +3200,15 @@ mod tests {
         assert_eq!(get(&e, "ACTIONS_CACHE_URL"), s("http://h:10/tok/"));
         assert_eq!(get(&e, "ACTIONS_CACHE_SERVICE_V2"), s("true"));
         assert_eq!(get(&e, "ACTIONS_RESULTS_URL"), s("http://h:20/"));
-        assert!(e.contains_key("ACTIONS_RUNTIME_URL") && e.contains_key("ACTIONS_RUNTIME_TOKEN"));
+        assert_eq!(get(&e, "ACTIONS_RUNTIME_URL"), Some(runtime_url.clone()));
+        assert!(e.contains_key("ACTIONS_RUNTIME_TOKEN"));
 
         let e = env(&servers(false, true, None, false), CacheMode::Write);
         assert_eq!(get(&e, "ACTIONS_CACHE_URL"), None);
         assert_eq!(get(&e, "ACTIONS_CACHE_SERVICE_V2"), None);
         assert_eq!(get(&e, "ACTIONS_RESULTS_URL"), s("http://h:20/"));
-        assert!(e.contains_key("ACTIONS_RUNTIME_URL") && e.contains_key("ACTIONS_RUNTIME_TOKEN"));
+        assert_eq!(get(&e, "ACTIONS_RUNTIME_URL"), Some(runtime_url));
+        assert!(e.contains_key("ACTIONS_RUNTIME_TOKEN"));
 
         assert!(env(&servers(false, false, None, false), CacheMode::Write).is_empty());
 
@@ -2557,6 +3223,7 @@ mod tests {
         );
         assert_eq!(get(&e, "ACTIONS_CACHE_SERVICE_V2"), s("true"));
         assert_eq!(get(&e, "ACTIONS_RESULTS_URL"), s("https://proxy.example/"));
+        assert_eq!(get(&e, "ACTIONS_RUNTIME_URL"), None);
         assert_eq!(
             url_origin("https://proxy.example/prefix/"),
             "https://proxy.example"
@@ -2569,13 +3236,25 @@ mod tests {
                 .unwrap();
         assert_eq!(claims["runthrough_cache_mode"], "read");
 
-        // With the caller's token, only `write` jobs get v2.
+        // With the caller's token, only `write` jobs get v2; the others get an
+        // empty value, which overrides one inherited from runthrough's own
+        // environment (the toolkit tests it for truthiness).
         let caller = servers(true, false, None, true);
-        let e = env(&caller, CacheMode::Read);
-        assert_eq!(get(&e, "ACTIONS_RUNTIME_TOKEN"), s("ghs_real"));
-        assert_eq!(get(&e, "ACTIONS_CACHE_SERVICE_V2"), None);
-        assert_eq!(get(&e, "ACTIONS_CACHE_URL"), s("http://h:10/tok/read/"));
-        assert_eq!(get(&e, "ACTIONS_RESULTS_URL"), s("http://h:10/"));
+        for mode in [CacheMode::Read, CacheMode::WriteOnly, CacheMode::Disabled] {
+            let e = env(&caller, mode);
+            assert_eq!(get(&e, "ACTIONS_RUNTIME_TOKEN"), s("ghs_real"));
+            assert_eq!(
+                get(&e, "ACTIONS_CACHE_SERVICE_V2"),
+                s(""),
+                "{}",
+                mode.name()
+            );
+            assert_eq!(
+                get(&e, "ACTIONS_CACHE_URL"),
+                Some(format!("http://h:10/tok/{}/", mode.name()))
+            );
+            assert_eq!(get(&e, "ACTIONS_RESULTS_URL"), s("http://h:10/"));
+        }
         let e = env(&caller, CacheMode::Write);
         assert_eq!(get(&e, "ACTIONS_CACHE_SERVICE_V2"), s("true"));
     }
