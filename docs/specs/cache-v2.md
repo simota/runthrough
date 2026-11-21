@@ -512,3 +512,91 @@ merged A before running their done conditions.
   "not supported"/"not served" wording; `grep -n 'Unreleased' CHANGELOG.md` finds the section;
   every statement matches merged unit A (check against `src/servers.rs`); `make check
   CARGO_FLAGS=--offline` passes.
+
+## 5. BuildKit (go-actions-cache) compatibility
+
+`ACTIONS_CACHE_SERVICE_V2=true` in every job also moves BuildKit's `type=gha` cache
+(`docker/build-push-action`, buildx) from the v1 API to v2. Its client is the Go library
+tonistiigi/go-actions-cache with the Azure azblob Go SDK. The facts below come from the
+library's `cache.go` and `cache_v2.go` (master) as given to this unit; neither the library nor
+the SDK is on this machine, and the SDK details marked *(unverified)* are likely, not read.
+
+### 5.1 Client facts
+
+- v2 is chosen when `ACTIONS_CACHE_SERVICE_V2` parses as true with Go's `strconv.ParseBool`
+  (`true` does). Calls go to `ACTIONS_RESULTS_URL` (trailing slashes trimmed) +
+  `/twirp/github.actions.results.api.v1.CacheService/<Method>`, POST, `Authorization: Bearer`,
+  `Content-Type: application/json`. The token is parsed unverified for `ac`, `exp` and `nbf`,
+  which runthrough's tokens already carry.
+- Requests: `CreateCacheEntry {key, version}`; `FinalizeCacheEntryUpload {key, size_bytes,
+  version}`, `size_bytes` a JSON number or a string; `GetCacheEntryDownloadURL {key,
+  restore_keys, version}`, `restore_keys` repeating every key passed in. Responses are decoded
+  with `encoding/json` from snake_case fields (`ok`, `signed_upload_url`, `message`, `entry_id`,
+  `signed_download_url`, `matched_key`); a field of the wrong JSON type fails the whole decode.
+- `ok: false` on Create is the error "failed to reserve cache: <message>"; on Get it is a miss.
+- "Already exists" is recognised only on a non-2xx answer: the body is decoded as an error with
+  a type and a message, and counts as `os.ErrExist` when the type contains `AlreadyExists` (the
+  library maps the code `already_exists` to `ArtifactCacheItemAlreadyExistsException`) or the
+  lowercased message contains "already exists". BuildKit's `SaveMutable` relies on it to move on
+  from `key#N` to the next index. Whether the library reads Twirp's `msg` or a `message` field
+  is not known.
+- Upload: `blockblob.NewClientWithNoCredential(signedUploadURL).UploadStream(...)`: a single Put
+  Blob for small data, otherwise Put Block (`comp=block&blockid=<base64>`) calls and a Put Block
+  List (`comp=blocklist`) whose XML body starts with `<?xml version="1.0" encoding="UTF-8"?>`
+  and a newline *(unverified)*. The library then dereferences `*resp.RequestID` without a nil
+  check; the SDK fills it from the `x-ms-request-id` response header, so a blob answer without
+  it crashes BuildKit.
+- Download: `DownloadStream` with `Range: {Offset: offset}` and no count. The SDK sends
+  `x-ms-range: bytes=<offset>-` (possibly `Range` as well or instead) only when the offset is
+  non-zero, and expects 200 or 206 *(unverified)*. On 401/403 the library asks for a new URL
+  once.
+
+### 5.2 What the server does for them
+
+- **Downloads** (`cache_v2_download`, `byte_range`): `GET /cache-v2/download/<id>` honours
+  `x-ms-range` (which wins) or `Range` of the forms `bytes=N-` and `bytes=N-M` (`M` past the
+  end means the end): `206` with `Content-Range: bytes N-M/<size>` and the exact
+  `Content-Length`, streamed from the file. A start at or beyond the end is `416`. No range, or
+  a range of any other form (suffix `bytes=-N`, several ranges, `M < N`), is `200` with the
+  whole blob, as before, which HTTP allows a server to do; the toolkit sends none. `HEAD` on the
+  same signed URL answers the same headers (`Content-Length` of the blob or range) without a
+  body. `Response.file` is now a `FileBody` (file, optional range, HEAD flag); every other
+  caller sends what it sent before.
+- **409 on CreateCacheEntry**: `{"code": "already_exists", "msg": M, "message": M}` with
+  M = "a cache entry with this key and version already exists or is being uploaded", so either
+  way the library has of reading it gives `os.ErrExist`, and the toolkit still finds no
+  `insufficient usage` and no key in it.
+- **`entry_id`** stays a JSON string (`"7"`). proto3 JSON writes `int64` as a string, so a Go
+  struct mirroring the proto most likely declares it `string`; the toolkit's generated code
+  (§1.2) reads `int64` from a string or a number, so the string decodes for both. Had the Go
+  struct used `int64` without `,string`, the decode would fail; that is the remaining risk.
+- **`size_bytes`** goes through `json_u64` (string or number), unchanged.
+- **Block lists**: `block_list` already skips an XML declaration with attributes and
+  whitespace or newlines around and between elements; a test sends the Go-SDK-style body.
+- **`x-ms-request-id`**: every response of both servers already carried
+  `x-ms-request-id: runthrough` and `x-ms-version: 2024-11-04`, so Put Blob, Put Block, Put Block
+  List and download answers have it (tested). It is not unique per response and the request's
+  `x-ms-version` is not echoed: either needs per-response headers on `Response`, a new field
+  that `src/dashboard.rs` (outside this change) would have to name in its struct literal. The
+  library only needs the header present.
+- `restore_keys` repeating the key and `key#` prefix lookups already worked: the exact key
+  first, then the newest entry whose key starts with a restore key, so `SaveMutable`'s
+  `Load("key#")` gets the newest index and a Create of an existing index gets the 409 above.
+
+Tests (`src/servers.rs`): `cache_v2_downloads_serve_byte_ranges`,
+`cache_v2_head_answers_the_headers_only`, `cache_v2_blob_answers_carry_a_request_id`,
+`cache_v2_conflicts_are_already_exists_for_go_clients`, `cache_v2_serves_a_go_client_sequence`,
+`cache_v2_save_mutable_finds_the_newest_index`, and a ranged GET through the artifact port in
+`artifact_port_forwards_cache_v2`.
+
+### 5.3 Not confirmed
+
+- No real BuildKit or buildx run went through the v2 routes; everything above is checked
+  against handler-level tests built from the facts in §5.1.
+- The SDK details marked *(unverified)*: which range header it sends, whether small uploads are
+  one Put Blob, the exact block list XML, and whether it checks anything else in the answers
+  (for example an echoed `x-ms-client-request-id`, which the server does not send).
+- The Go struct type of `entry_id`, and whether the library reads `msg` or `message`.
+- Keys are stored and returned lowercased (as in v1). If the library takes the index from
+  `matched_key` by trimming the `key#` prefix it asked for, a `type=gha` scope with upper-case
+  letters would not match it; not checked against the library.
