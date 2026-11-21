@@ -6,7 +6,7 @@ Each release's section is published as its GitHub release notes (see [RUNBOOK.md
 
 ### Added
 
-- The cache server answers the cache service v2 API (`ACTIONS_CACHE_SERVICE_V2`) used by `actions/cache@v4`, sharing entries with the v1 API. Jobs get `ACTIONS_CACHE_SERVICE_V2` and, without `--artifact-server-path`, an `ACTIONS_RESULTS_URL` pointing at the cache server.
+- The cache server answers the cache service v2 API (`ACTIONS_CACHE_SERVICE_V2`) used by `actions/cache@v4`, sharing entries with the v1 API. While the cache server runs, jobs get `ACTIONS_CACHE_SERVICE_V2` (except non-`write` `cache-mode` jobs when runthrough's own environment sets `ACTIONS_RUNTIME_TOKEN`) and, without `--artifact-server-path`, an `ACTIONS_RESULTS_URL` pointing at the cache server.
 
 ## 0.3.0
 
